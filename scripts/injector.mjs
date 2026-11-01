@@ -8,6 +8,7 @@ import { createAutoUpdater } from "./auto-updater.mjs";
 import { AutoResumeController, createAutoResumeStateStore } from "./auto-resume.mjs";
 import { sendContinueThroughDesktop } from "./desktop-request.mjs";
 import { isMainCodexRendererTarget, syncWindowThread } from "./current-thread.mjs";
+import { applySideChat, removeSideChatExpression } from "./side-chat.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -411,6 +412,7 @@ async function updateMonitor(session, usage, settingsStore) {
 }
 
 async function removeFromSession(session) {
+  await session.evaluate(removeSideChatExpression());
   return session.evaluate(removeExpression());
 }
 
@@ -569,6 +571,7 @@ async function runWatch(options) {
       session.on("Page.loadEventFired", () => {
         syncEntryThread(entry)
           .then(() => applyMonitor(session, usageForEntry(entry), settingsStore))
+          .then(() => applySideChat(session))
           .catch((error) => console.error(`[usage-monitor] renderer reload failed: ${error.message}`));
       });
       await registerSettingsBinding(session, settingsStore, async () => {
@@ -581,6 +584,7 @@ async function runWatch(options) {
       });
       await registerConfigurationBinding(session, options.port);
       await applyMonitor(session, usageForEntry(entry), settingsStore);
+      await applySideChat(session);
       autoUpdater.settingsChanged(settingsStore.current);
       usageClient.setRefreshInterval(settingsStore.current?.refreshEvery30Seconds ? 30000 : 60000);
       usageClient.setAutoResumeThreadIds(Object.entries(settingsStore.current?.autoResumeThreads || {}).filter(([, config]) => config?.enabled === true).map(([id]) => id));

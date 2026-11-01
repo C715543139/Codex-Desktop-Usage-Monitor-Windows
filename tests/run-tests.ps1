@@ -55,6 +55,7 @@ foreach ($file in $powerShellFiles) {
 }
 
 $javascriptFiles = @(
+  'assets\side-chat-adapter.js', 'assets\side-chat-save.js', 'scripts\side-chat.mjs', 'scripts\side-chat-store.mjs', 'tests\side-chat.mjs',
   'assets\usage-constants.js', 'assets\usage-i18n.js', 'assets\usage-placement.js',
   'assets\usage-inject.js', 'assets\usage-history.js', 'scripts\injector.mjs', 'scripts\current-thread.mjs', 'scripts\usage-client.mjs', 'scripts\usage\scheduling.mjs', 'scripts\usage\history.mjs', 'tests\usage-history.mjs', 'scripts\validate-provider.mjs',
   'scripts\ui-settings.mjs', 'scripts\auto-updater.mjs', 'scripts\auto-update-worker.mjs', 'scripts\auto-resume.mjs', 'scripts\desktop-request.mjs', 'tests\current-thread.mjs', 'tests\usage-client.mjs', 'tests\usage-monitor-lifecycle.mjs', 'tests\ui-settings.mjs', 'tests\auto-updater.mjs', 'tests\auto-update-worker.mjs', 'tests\auto-resume.mjs', 'tests\desktop-request.mjs', 'tests\auto-resume-integration.mjs'
@@ -86,6 +87,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Automatic update worker tests failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Quota recovery auto-resume tests failed.' }
 & $node (Join-Path $root 'tests\desktop-request.mjs')
 if ($LASTEXITCODE -ne 0) { throw 'Codex Desktop internal request submission tests failed.' }
+& $node (Join-Path $root 'tests\side-chat.mjs')
+if ($LASTEXITCODE -ne 0) { throw 'Side-chat save tests failed.' }
 & $node (Join-Path $root 'tests\auto-resume-integration.mjs')
 if ($LASTEXITCODE -ne 0) { throw 'Quota recovery auto-resume integration tests failed.' }
 & $pwsh -NoLogo -NoProfile -File (Join-Path $root 'tests\auto-update.ps1')
