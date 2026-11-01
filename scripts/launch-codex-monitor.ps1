@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 
 function Get-CodexMonitorLaunchPlan([bool]$DebugReady, [bool]$CodexRunning) {
   if ($DebugReady) { return 'reuse-codex' }
-  if ($CodexRunning) { return 'blocked-running-without-cdp' }
+  if ($CodexRunning) { return 'restart-native-codex' }
   return 'launch-codex'
 }
 
@@ -18,7 +18,7 @@ if ($SelfTest) {
   $cases = @(
     @{ DebugReady = $true; CodexRunning = $true; Expected = 'reuse-codex' },
     @{ DebugReady = $true; CodexRunning = $false; Expected = 'reuse-codex' },
-    @{ DebugReady = $false; CodexRunning = $true; Expected = 'blocked-running-without-cdp' },
+    @{ DebugReady = $false; CodexRunning = $true; Expected = 'restart-native-codex' },
     @{ DebugReady = $false; CodexRunning = $false; Expected = 'launch-codex' }
   )
   foreach ($case in $cases) {
@@ -65,25 +65,34 @@ function Write-CodexMonitorLaunchError([string]$Message) {
 }
 
 try {
-  $codexRunning = @(Get-Process ChatGPT -ErrorAction SilentlyContinue).Count -gt 0
+  [void](Set-CodexUsageRuntimeControl -Enabled $true -Reason 'launcher')
+  [void](Start-CodexUsageRuntimeSupervisor -Port $Port)
+  $codexRunning = @(Get-CodexUsageMainCodexProcesses).Count -gt 0
   $activePort = if ($codexRunning) { Resolve-CodexUsageCdpPort $Port } else { 0 }
   $debugReady = [bool]$activePort
   if ($codexRunning -and -not $debugReady) {
     # A process launched with CDP can exist well before its renderer is ready.
-    # Do not mistake that loading interval for a native launch without CDP.
-    $activePort = Wait-CodexUsagePendingCdpPort
+    try { $activePort = Wait-CodexUsagePendingCdpPort } catch { $activePort = 0 }
     $debugReady = [bool]$activePort
   }
   $plan = Get-CodexMonitorLaunchPlan $debugReady $codexRunning
-  if ($plan -eq 'blocked-running-without-cdp') {
-    Show-CodexMonitorMessage 'Codex 已通过原生入口运行，无法在不中断会话的情况下补加监视端口。请先正常退出 Codex，再点击“Codex Usage Monitor”。' 'Warning'
-    exit 2
+  if ($plan -eq 'restart-native-codex') {
+    $deadline = (Get-Date).AddSeconds(45)
+    do {
+      Start-Sleep -Milliseconds 500
+      $activePort = Resolve-CodexUsageCdpPort $Port
+      if ($activePort) { break }
+    } while ((Get-Date) -lt $deadline)
+    if (-not $activePort) {
+      throw '运行时协调器未能将原生 Codex 切换为带监视插件的模式。请查看 runtime-supervisor.log。'
+    }
+    $debugReady = $true
   }
   if ($debugReady) { $Port = $activePort }
   if (-not $debugReady) {
     $Port = Resolve-CodexUsageAvailablePort -PreferredPort $Port
     $launch = Start-CodexUsagePackagedCodex -Port $Port
-    if (-not (Wait-CodexUsageCdpPort -Port $Port -ProcessId $launch.ProcessId)) { throw "Codex 调试端口 $Port 未就绪（PID $($launch.ProcessId)）；启动进程已退出或超过 180 秒启动期限，可能存在启动残留。脚本未结束 Codex，请正常退出后重试。" }
+    if (-not (Wait-CodexUsageCdpPort -Port $Port -ProcessId $launch.ProcessId)) { throw "Codex 调试端口 $Port 未就绪（PID $($launch.ProcessId)）；启动进程已退出或超过 180 秒启动期限，可能存在启动残留。请查看 runtime-supervisor.log。" }
   }
   & (Join-Path $PSScriptRoot 'start-monitor.ps1') -Port $Port
   # start-monitor.ps1 throws on failure. LASTEXITCODE may still contain a failed

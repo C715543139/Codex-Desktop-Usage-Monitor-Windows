@@ -656,12 +656,22 @@ function Test-CodexUsagePackagePath([string]$InjectorPath) {
   } catch { return $false }
 }
 
+function Test-CodexUsageManagedInjectorPath([string]$InjectorPath) {
+  if (-not $InjectorPath) { return $false }
+  try {
+    $managedRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs\CodexUsageMonitor')).TrimEnd('\') + '\'
+    $full = [IO.Path]::GetFullPath($InjectorPath)
+    return $full.StartsWith($managedRoot, [StringComparison]::OrdinalIgnoreCase) -and
+      $full.Substring($managedRoot.Length) -match '^\d+\.\d+\.\d+[\\/]scripts[\\/]injector\.mjs$'
+  } catch { return $false }
+}
+
 function Get-CodexUsageInjectorProcesses {
   try {
     foreach ($process in Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction Stop) {
       $commandLine = [string]$process.CommandLine
       $injectorPath = Get-CodexUsageInjectorPathFromCommandLine $commandLine
-      if (-not $injectorPath -or -not (Test-CodexUsagePackagePath $injectorPath)) { continue }
+      if (-not $injectorPath -or (-not (Test-CodexUsagePackagePath $injectorPath) -and -not (Test-CodexUsageManagedInjectorPath $injectorPath))) { continue }
       $port = 0
       $match = [regex]::Match($commandLine, '(?i)(?:^|\s)--port(?:=|\s+)(\d+)(?:\s|$)')
       if ($match.Success) { [void][int]::TryParse($match.Groups[1].Value, [ref]$port) }
@@ -690,6 +700,18 @@ function Test-CodexUsageReusableInjector($State, $InjectorProcess, [string]$Inje
     $InjectorProcess.InjectorPath -eq $InjectorPath -and
     $statePath -eq $InjectorPath -and
     $stateVersion -eq $CodexUsageVersion
+}
+
+function Test-CodexUsageInjectorStartupExpired($State, [int]$TimeoutSeconds = 180) {
+  $lastActivity = [DateTimeOffset]::MinValue
+  foreach ($name in @('startedAt', 'startupVerifiedAt')) {
+    if (-not $State -or -not $State.PSObject.Properties[$name]) { continue }
+    $timestamp = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse([string]$State.$name, [ref]$timestamp) -and $timestamp -gt $lastActivity) {
+      $lastActivity = $timestamp
+    }
+  }
+  return $lastActivity -eq [DateTimeOffset]::MinValue -or ([DateTimeOffset]::UtcNow - $lastActivity).TotalSeconds -ge $TimeoutSeconds
 }
 
 function Get-CodexUsageTargets([int]$Port) {
@@ -927,4 +949,191 @@ function Write-CodexUsageState($State) {
     $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding utf8
     Move-Item -LiteralPath $temporary -Destination $CodexUsageStatePath -Force
   } finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+}
+
+
+function Get-CodexUsageRuntimeControl {
+  $controlPath = Join-Path $CodexUsageStateRoot 'runtime-control.json'
+  if (-not (Test-Path -LiteralPath $controlPath -PathType Leaf)) {
+    return [pscustomobject]@{ schemaVersion = 1; enabled = $true; reason = 'default'; updatedAt = $null }
+  }
+  try {
+    $value = Get-Content -LiteralPath $controlPath -Raw -ErrorAction Stop | ConvertFrom-Json
+    if (-not $value -or -not $value.PSObject.Properties['enabled']) { throw 'enabled is missing' }
+    return [pscustomobject]@{
+      schemaVersion = 1
+      enabled = [bool]$value.enabled
+      reason = if ($value.reason) { [string]$value.reason } else { 'persisted' }
+      updatedAt = if ($value.updatedAt) { [string]$value.updatedAt } else { $null }
+    }
+  } catch {
+    return [pscustomobject]@{ schemaVersion = 1; enabled = $false; reason = 'invalid-control'; updatedAt = $null }
+  }
+}
+
+function Set-CodexUsageRuntimeControl {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)][bool]$Enabled,
+    [string]$Reason = 'command'
+  )
+  New-Item -ItemType Directory -Force -Path $CodexUsageStateRoot | Out-Null
+  $controlPath = Join-Path $CodexUsageStateRoot 'runtime-control.json'
+  $temporary = "$controlPath.$PID.tmp"
+  $value = [ordered]@{
+    schemaVersion = 1
+    enabled = $Enabled
+    reason = $Reason
+    updatedAt = (Get-Date).ToString('o')
+  }
+  try {
+    [IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 4), $CodexUsageUtf8)
+    Move-Item -LiteralPath $temporary -Destination $controlPath -Force
+    return [pscustomobject]$value
+  } finally {
+    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Get-CodexUsageMainCodexProcesses {
+  $result = [Collections.Generic.List[object]]::new()
+  try {
+    foreach ($process in Get-CimInstance Win32_Process -Filter "Name = 'ChatGPT.exe'" -ErrorAction Stop) {
+      $commandLine = [string]$process.CommandLine
+      if ($commandLine -match '(?:^|\s)--type(?:=|\s)') { continue }
+      $createdAt = $null
+      if ($process.CreationDate) {
+        try { $createdAt = ([DateTime]$process.CreationDate).ToUniversalTime() } catch {}
+      }
+      $result.Add([pscustomobject]@{
+        ProcessId = [int]$process.ProcessId
+        ParentProcessId = [int]$process.ParentProcessId
+        CreationDate = $createdAt
+        ExecutablePath = [string]$process.ExecutablePath
+        CommandLine = $commandLine
+        HasCdpArgument = [bool]($commandLine -match '--remote-debugging-port(?:=|\s+)(\d+)')
+      })
+    }
+  } catch {}
+  return $result.ToArray()
+}
+
+function Get-CodexUsageRuntimeSupervisorPathFromCommandLine([string]$CommandLine) {
+  if (-not $CommandLine) { return $null }
+  $match = [regex]::Match($CommandLine, '(?i)(?:^|\s)-File\s+(?:"(?<quoted>[^"]*[\\/]runtime-supervisor\.ps1)"|(?<plain>\S*[\\/]runtime-supervisor\.ps1))')
+  if (-not $match.Success) { return $null }
+  $value = if ($match.Groups['quoted'].Success) { $match.Groups['quoted'].Value } else { $match.Groups['plain'].Value }
+  try { return [IO.Path]::GetFullPath($value) } catch { return $null }
+}
+
+function Get-CodexUsageRuntimeSupervisorProcesses {
+  $result = [Collections.Generic.List[object]]::new()
+  try {
+    foreach ($process in Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe' OR Name = 'powershell.exe'" -ErrorAction Stop) {
+      $scriptPath = Get-CodexUsageRuntimeSupervisorPathFromCommandLine ([string]$process.CommandLine)
+      if (-not $scriptPath) { continue }
+      $result.Add([pscustomobject]@{
+        ProcessId = [int]$process.ProcessId
+        ParentProcessId = [int]$process.ParentProcessId
+        ScriptPath = $scriptPath
+        CommandLine = [string]$process.CommandLine
+      })
+    }
+  } catch {}
+  return $result.ToArray()
+}
+
+function Start-CodexUsageRuntimeSupervisor {
+  [CmdletBinding()]
+  param(
+    [ValidateRange(1024, 65535)][int]$Port = 9335,
+    [switch]$Replace
+  )
+  $powerShellCommand = Get-Command pwsh -ErrorAction SilentlyContinue
+  $powerShellPath = if ($powerShellCommand) { $powerShellCommand.Source } else { Get-CodexUsageWindowsPowerShellPath }
+  $scriptPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'runtime-supervisor.ps1'))
+  if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) { throw "运行时协调器不存在：$scriptPath" }
+  $hiddenLauncher = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'launch-runtime-supervisor-hidden.vbs'))
+  if (-not (Test-Path -LiteralPath $hiddenLauncher -PathType Leaf)) { throw "隐藏协调器启动器不存在：$hiddenLauncher" }
+  $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+  if (-not (Test-Path -LiteralPath $wscript -PathType Leaf)) { throw "Windows Script Host 不存在：$wscript" }
+  $launchMutex = [Threading.Mutex]::new($false, 'Local\CodexUsageRuntimeSupervisorLaunch')
+  $launchAcquired = $false
+  try {
+    try { $launchAcquired = $launchMutex.WaitOne([TimeSpan]::FromSeconds(15)) }
+    catch [Threading.AbandonedMutexException] { $launchAcquired = $true }
+    if (-not $launchAcquired) { throw '另一个协调器启动操作仍在进行。' }
+    $existing = @(Get-CodexUsageRuntimeSupervisorProcesses)
+    $matching = @($existing | Where-Object { [IO.Path]::GetFullPath($_.ScriptPath) -eq $scriptPath })
+    $process = $null
+    if ($Replace -or -not $matching.Count) {
+      if ($existing.Count -gt 0) { Stop-CodexUsageRuntimeSupervisorProcesses -Force }
+      $arguments = @(('"{0}"' -f $hiddenLauncher), ('"{0}"' -f $powerShellPath), "$Port")
+      $process = Start-Process -FilePath $wscript -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+      $matching = @(Get-CodexUsageRuntimeSupervisorProcesses | Where-Object { [IO.Path]::GetFullPath($_.ScriptPath) -eq $scriptPath })
+      try {
+        $statusPath = Join-Path $CodexUsageStateRoot 'runtime-supervisor.json'
+        $status = Get-Content -LiteralPath $statusPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        $ready = @($matching | Where-Object { $_.ProcessId -eq $status.supervisorPid })
+        if ($ready.Count -gt 0 -and $status.supervisorPath -eq $scriptPath -and $status.phase -notin @('disabled', 'failed')) {
+          return $ready[0]
+        }
+      } catch {}
+      if ($process) {
+        $process.Refresh()
+        if ($process.HasExited -and -not $matching.Count) { break }
+      }
+      Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw '隐藏协调器未能启动，请查看 runtime-supervisor.log。'
+  } finally {
+    if ($launchAcquired) { try { $launchMutex.ReleaseMutex() } catch {} }
+    $launchMutex.Dispose()
+  }
+}
+
+function Stop-CodexUsageRuntimeSupervisorProcesses {
+  [CmdletBinding()]
+  param(
+    [ValidateRange(0, 60)][int]$GracefulTimeoutSeconds = 8,
+    [switch]$Force
+  )
+  $initial = @(Get-CodexUsageRuntimeSupervisorProcesses)
+  if (-not $initial.Count) { return }
+  if (-not $Force -and $GracefulTimeoutSeconds -gt 0) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($GracefulTimeoutSeconds)
+    do {
+      $pids = @($initial | ForEach-Object { $_.ProcessId } | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+      if (-not $pids.Count) { return }
+      if ([DateTime]::UtcNow -ge $deadline) { break }
+      Start-Sleep -Milliseconds 250
+    } while ($true)
+  }
+  foreach ($process in @(Get-CodexUsageRuntimeSupervisorProcesses)) {
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Stop-CodexUsageCodexProcessGeneration {
+  [CmdletBinding()]
+  param([int[]]$RootProcessIds = @())
+  $roots = @($RootProcessIds | Where-Object { $_ -gt 0 } | Select-Object -Unique)
+  if (-not $roots.Count) { return }
+  $selected = [Collections.Generic.HashSet[int]]::new()
+  foreach ($rootId in $roots) { [void]$selected.Add($rootId) }
+  try {
+    $processes = @(Get-CimInstance Win32_Process -Filter "Name = 'ChatGPT.exe'" -ErrorAction Stop)
+    do {
+      $added = $false
+      foreach ($process in $processes) {
+        if ($selected.Contains([int]$process.ParentProcessId) -and $selected.Add([int]$process.ProcessId)) { $added = $true }
+      }
+    } while ($added)
+  } catch {}
+  foreach ($processId in @($selected)) {
+    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+  }
 }

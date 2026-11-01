@@ -99,6 +99,8 @@ foreach ($relative in $files) {
 if (-not $SkipShortcut) {
   $launcherInstaller = Join-Path $installDirectory 'scripts\install-monitor-launcher.ps1'
   & $launcherInstaller -Port $Port -DestinationDirectory $ShortcutDirectory
+  $runtimeSupervisorInstaller = Join-Path $installDirectory 'scripts\install-runtime-supervisor.ps1'
+  & $runtimeSupervisorInstaller -Port $Port
 }
 
 Write-Host "Codex Usage Monitor $version installed to: $installDirectory"

@@ -25,6 +25,7 @@ const PERSISTED_SETTINGS_KEY = "__CODEX_USAGE_MONITOR_PERSISTED_SETTINGS__";
 const SETTINGS_BINDING = "__codexUsageMonitorSaveSettings";
 const CONFIGURATION_KEY = "__CODEX_USAGE_MONITOR_CONFIGURATION__";
 const CONFIGURATION_BINDING = "__codexUsageMonitorConfigureSource";
+const MONITOR_CONTROL_BINDING = "__codexUsageMonitorControl";
 const MAX_CONFIGURATION_BYTES = 131072;
 const TARGET_ABSENCE_EXIT_MS = 180000;
 
@@ -312,15 +313,24 @@ function configurationResultExpression(requestId, result) {
   return `(() => window[${JSON.stringify(STATE_KEY)}]?.configurationResult?.(${JSON.stringify(requestId)}, ${JSON.stringify(result)}) || false)()`;
 }
 
+function monitorControlResultExpression(requestId, result) {
+  return `(() => window[${JSON.stringify(STATE_KEY)}]?.monitorControlResult?.(${JSON.stringify(requestId)}, ${JSON.stringify(result)}) || false)()`;
+}
+
 function readSettingsExpression() {
   return `(() => window[${JSON.stringify(STATE_KEY)}]?.getSettings?.() || null)()`;
 }
 
-async function registerSettingsBinding(session, settingsStore, onSettingsChanged = null) {
+async function registerSettingsBinding(session, settingsStore, onSettingsChanged = null, controlPort = null) {
   session.on("Runtime.bindingCalled", ({ name, payload }) => {
     if (name !== SETTINGS_BINDING || typeof payload !== "string" || Buffer.byteLength(payload, "utf8") > MAX_UI_SETTINGS_BYTES) return;
     let value;
     try { value = JSON.parse(payload); } catch { return; }
+    if (value?.action === "stop-monitor") {
+      const requestId = typeof value.requestId === "string" ? value.requestId : "";
+      if (/^[a-z0-9-]{8,64}$/.test(requestId) && controlPort) beginMonitorStop(session, requestId, controlPort);
+      return;
+    }
     settingsStore.save(value)
       .then((saved) => onSettingsChanged?.(saved))
       .catch((error) => console.error(`[usage-monitor] UI settings save failed: ${error.message}`));
@@ -365,6 +375,96 @@ function runPanelConfiguration(request) {
     child.stdin.on("error", () => {});
     child.stdin.end(JSON.stringify(request));
   });
+}
+
+async function disableRuntimeForShutdown() {
+  if (!process.env.LOCALAPPDATA) throw new Error("本机状态目录不可用。");
+  const stateRoot = path.join(process.env.LOCALAPPDATA, "CodexUsageMonitor");
+  const controlPath = path.join(stateRoot, "runtime-control.json");
+  const temporary = `${controlPath}.${process.pid}.tmp`;
+  await fs.mkdir(stateRoot, { recursive: true });
+  try {
+    await fs.writeFile(temporary, JSON.stringify({ schemaVersion: 1, enabled: false, reason: "ui", updatedAt: new Date().toISOString() }), "utf8");
+    await fs.rename(temporary, controlPath);
+  } finally { await fs.unlink(temporary).catch(() => {}); }
+}
+
+export function createMonitorStopController({
+  prepare = disableRuntimeForShutdown,
+  launch = spawn,
+  powerShell = process.env.CODEX_USAGE_POWERSHELL_PATH || "pwsh.exe",
+  script = path.join(root, "scripts", "restore-monitor.ps1"),
+  startupTimeoutMs = 15000,
+  completionTimeoutMs = 30000,
+  logError = (message) => console.error(`[usage-monitor] monitor shutdown failed: ${message}`),
+} = {}) {
+  let active = false;
+  return async (session, requestId, port) => {
+    if (active) return false;
+    active = true;
+    let child, timer, started = false, finished = false, stdout = "", stderr = "";
+    const notify = (result) => session.evaluate(monitorControlResultExpression(requestId, result)).catch(() => {});
+    const finish = async (result) => {
+      if (finished) return;
+      finished = true;
+      active = false;
+      clearTimeout(timer);
+      if (!result.ok) logError(result.message);
+      await notify(result);
+    };
+    const armTimeout = (milliseconds) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        try { child?.kill(); } catch {}
+        void finish({ ok: false, message: "退出服务超时，请重试并查看 shutdown.log。" });
+      }, milliseconds);
+    };
+    try {
+      // Disable relaunch before depending on an external shutdown process.
+      await prepare();
+      child = launch(powerShell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, "-Port", String(port), "-DisableRuntime", "-CloseCodex", "-ReportProgress", "-Reason", "ui"], {
+        detached: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+      });
+      armTimeout(startupTimeoutMs);
+      child.stdout.on("data", (chunk) => {
+        stdout = (stdout + String(chunk)).slice(-16384);
+        if (!started && stdout.includes('{"event":"shutdown-started"}')) {
+          started = true;
+          armTimeout(completionTimeoutMs);
+          void notify({ ok: true, pending: true });
+        }
+      });
+      child.stderr.on("data", (chunk) => { stderr = (stderr + String(chunk)).slice(-8192); });
+      child.once("error", (error) => { void finish({ ok: false, message: `无法启动退出服务：${error.message}` }); });
+      child.once("close", (code) => {
+        void finish(code === 0 && started
+          ? { ok: true }
+          : { ok: false, message: `退出服务失败（退出码 ${code}）：${stderr.trim().slice(-1600) || "请查看 shutdown.log。"}` });
+      });
+      child.unref();
+      return true;
+    } catch (error) {
+      await finish({ ok: false, message: `无法执行退出操作：${error.message}` });
+      return false;
+    }
+  };
+}
+
+const requestMonitorStop = createMonitorStopController();
+function beginMonitorStop(session, requestId, port) {
+  void requestMonitorStop(session, requestId, port);
+}
+
+async function registerMonitorControlBinding(session, port) {
+  session.on("Runtime.bindingCalled", ({ name, payload }) => {
+    if (name !== MONITOR_CONTROL_BINDING || typeof payload !== "string" || Buffer.byteLength(payload, "utf8") > MAX_CONFIGURATION_BYTES) return;
+    let request;
+    try { request = JSON.parse(payload); } catch { return; }
+    const requestId = typeof request?.requestId === "string" ? request.requestId : "";
+    if (!/^[a-z0-9-]{8,64}$/.test(requestId) || request?.action !== "stop-monitor") return;
+    beginMonitorStop(session, requestId, port);
+  });
+  await session.send("Runtime.addBinding", { name: MONITOR_CONTROL_BINDING });
 }
 
 function startMonitorReplacement(port) {
@@ -452,7 +552,8 @@ export async function runOnce(options) {
         results.push({ targetId: target.id, removed: await removeFromSession(session) });
         continue;
       }
-      await registerSettingsBinding(session, settingsStore);
+      await registerSettingsBinding(session, settingsStore, null, options.port);
+      await registerMonitorControlBinding(session, options.port);
       const applied = await applyMonitor(session, null, settingsStore);
       if (options.screenshot) await capture(session, options.screenshot);
       const verified = await verifySession(session);
@@ -581,8 +682,9 @@ async function runWatch(options) {
         usageClient.setRefreshInterval(value?.refreshEvery30Seconds ? 30000 : 60000);
         usageClient.setAutoResumeThreadIds(Object.entries(value?.autoResumeThreads || {}).filter(([, config]) => config?.enabled === true).map(([id]) => id));
         return autoResumeController.settingsChanged(value);
-      });
+      }, options.port);
       await registerConfigurationBinding(session, options.port);
+      await registerMonitorControlBinding(session, options.port);
       await applyMonitor(session, usageForEntry(entry), settingsStore);
       await applySideChat(session);
       autoUpdater.settingsChanged(settingsStore.current);

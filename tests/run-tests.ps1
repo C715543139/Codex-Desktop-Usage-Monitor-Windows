@@ -182,8 +182,8 @@ if ($successProbe.TimedOut -or $successProbe.ExitCode -ne 0 -or $successProbe.St
 $runtimeFiles = @(
   'assets\usage-constants.js', 'assets\usage-i18n.js', 'assets\usage-placement.js',
   'assets\usage-inject.js', 'scripts\injector.mjs', 'scripts\current-thread.mjs', 'scripts\auto-updater.mjs', 'scripts\auto-update-worker.mjs', 'scripts\auto-resume.mjs', 'scripts\desktop-request.mjs', 'scripts\auto-update.ps1', 'scripts\usage-client.mjs', 'scripts\usage\scheduling.mjs', 'scripts\monitor-utils.ps1',
-  'scripts\start-monitor.ps1', 'scripts\launch-codex-monitor.ps1', 'scripts\launch-codex-monitor-hidden.vbs',
-  'scripts\install-monitor-launcher.ps1', 'scripts\configure-api-provider.ps1', 'scripts\clear-api-provider.ps1',
+  'scripts\start-monitor.ps1', 'scripts\launch-codex-monitor.ps1', 'scripts\launch-codex-monitor-hidden.vbs', 'scripts\launch-runtime-supervisor-hidden.vbs',
+  'scripts\install-monitor-launcher.ps1', 'scripts\install-runtime-supervisor.ps1', 'scripts\runtime-supervisor.ps1', 'scripts\restore-monitor.ps1', 'scripts\configure-api-provider.ps1', 'scripts\clear-api-provider.ps1',
   'scripts\configure-api-account.ps1', 'scripts\clear-api-account.ps1', 'scripts\configure-token-baseline.ps1', 'scripts\clear-token-baseline.ps1'
 )
 $runtimeSource = ($runtimeFiles | ForEach-Object { Get-Content -LiteralPath (Join-Path $root $_) -Raw -Encoding UTF8 }) -join "`n"
@@ -220,6 +220,10 @@ if ($runtimeSource -match 'window-not-focused' -or $runtimeSource -match 'blurHa
 if ($runtimeSource -notmatch 'LOCAL_TOKEN_IDLE_SCAN_MS\s*=\s*12000' -or $runtimeSource -notmatch 'localTokenNextScanDelay') { throw 'Adaptive local-token scan contract is missing.' }
 if ($runtimeSource -match '(?i)dream[ -]?skin|CODEX_DREAM|codex-dream') { throw 'Removed Dream Skin runtime compatibility is still present.' }
 if ($runtimeSource -notmatch 'runtimeVersion') { throw 'Runtime version state contract is missing.' }
+if ($runtimeSource -notmatch 'runtime-control\.json' -or $runtimeSource -notmatch '__codexUsageMonitorControl' -or $runtimeSource -notmatch 'stop-monitor' -or $runtimeSource -notmatch 'exitMonitorProcess') { throw 'Monitor lifecycle control contract is missing.' }
+if ($runtimeSource -notmatch 'Get-CodexUsageMainCodexProcesses' -or $runtimeSource -notmatch 'Start-CodexUsageRuntimeSupervisor' -or $runtimeSource -notmatch 'CloseMainWindow' -or $runtimeSource -notmatch 'restart-native-codex') { throw 'Runtime supervisor launch-enforcement contract is missing.' }
+if ($runtimeSource -notmatch 'Register-ScheduledTask' -or $runtimeSource -notmatch 'Codex Usage Monitor Runtime Supervisor') { throw 'Runtime supervisor logon task contract is missing.' }
+if ($runtimeSource -notmatch 'New-ScheduledTaskAction -Execute \$wscript' -or $runtimeSource -notmatch 'launch-runtime-supervisor-hidden\.vbs') { throw 'Runtime supervisor task must use the hidden WScript launcher.' }
 if ($runtimeSource -notmatch '--remote-debugging-address=127\.0\.0\.1') { throw 'Local CDP binding contract is missing.' }
 if ($runtimeSource -notmatch 'Codex Usage Monitor\.lnk') { throw 'English shortcut name contract is missing.' }
 if ($runtimeSource -notmatch 'launch-codex-monitor-hidden\.vbs') { throw 'Hidden launcher contract is missing.' }

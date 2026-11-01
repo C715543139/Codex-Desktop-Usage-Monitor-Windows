@@ -86,8 +86,13 @@ if (-not $Replace) {
       Write-Host "Codex 用量监视器已在端口 $Port 运行（PID $($candidate.ProcessId)）。"
       return
     }
-    Write-Host "监视器后台正在等待 Codex 界面就绪（端口 $Port，PID $($candidate.ProcessId)）；已复用等待中的后台，不重复启动。"
-    return
+    if (-not (Test-CodexUsageInjectorStartupExpired $state)) {
+      $state | Add-Member -NotePropertyName startupPhase -NotePropertyValue 'waiting-ui' -Force
+      Write-CodexUsageState $state
+      Write-Host "监视器后台正在等待 Codex 界面就绪（端口 $Port，PID $($candidate.ProcessId)）；已复用等待中的后台，不重复启动。"
+      return
+    }
+    Write-Warning "监视器后台超过 180 秒没有有效心跳，将启动替代后台（旧 PID $($candidate.ProcessId)）。"
   }
 }
 
@@ -126,7 +131,7 @@ try {
     port = $Port
     injectorPid = $daemon.Id
     injectorPath = $currentInjectorPath
-    startedAt = (Get-Date).ToString('o')
+    startedAt = $daemon.StartTime.ToString('o')
     stdoutPath = $stdoutPath
     stderrPath = $stderrPath
     startupPhase = $startupPhase

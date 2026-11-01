@@ -27,7 +27,7 @@ Codex Usage Monitor 把官方订阅周期、当前会话 Token、社区重置概
 
 ## 1. 三步开始使用
 
-当前本地版本 **v3.3.0**：新增旁支保存，复用监视器后台，无需 Codex++。变更见 [更新日志](CHANGELOG.md)。
+当前本地版本 **v3.4.3**：新增监控进程协调器和设置页退出入口，原生 Codex 启动后可自动切换为带插件模式。变更见 [更新日志](CHANGELOG.md)。
 
 ### 1.1 准备环境
 
@@ -48,7 +48,7 @@ Codex Usage Monitor 把官方订阅周期、当前会话 Token、社区重置概
 
 3. 正常退出已经打开的 Codex，然后双击桌面的 `Codex Usage Monitor` 快捷方式。
 
-专用快捷方式会同时启动 Codex 和监视器，并隐藏正常的黑色命令行窗口。原生 Codex 图标不会开放本机 CDP 端口，因此从原生图标启动时不会显示监视栏。
+专用快捷方式会同时启用监控进程并启动 Codex，隐藏正常的黑色命令行窗口。首次启用后，运行时协调器会在后台监听后续启动的 Codex；从原生图标启动的实例会被自动关闭，并以带 CDP 的方式重新打开。
 
 ### 1.3 让 Codex 帮你安装
 
@@ -164,6 +164,25 @@ Token 图复用本机增量扫描，只统计已采集且能确认使用官方�
 目前支持当前客户端的本地分页历史、文字和工具记录。旁支用户消息中的图片附件暂不支持；历史未完整加载、仍在执行、接口版本不兼容时，会在按钮提示或保存结果中说明原因。失败保留原旁支。建议在监视器启动后新建旁支；旧旁支只有在父历史未变化时才可恢复。
 
 此版需要手动点击「保存」；原生关闭按钮继续按原方式关闭临时旁支。界面接口首次连接可能需要几秒；若显示「保存不可用」，悬停查看原因。该模块出错不会停用用量监视。
+
+### 2.7 监控进程的启动与退出
+
+安装器会注册当前用户的隐藏登录协调器。监控启用时，协调器保持运行；任何未带 CDP 的新 Codex 主进程都会在短暂等待后被关闭，并重新以带监视插件的模式启动。已在设置页点击退出、或者监控被禁用时，协调器不会干预新的 Codex 启动。
+
+升级安装会切换正在运行的旧协调器，由新版接管现有 CDP 连接并加载插件。协调器区分已连接、等待页面和启动失败；后台超过 180 秒没有有效心跳时会启动替代后台。
+
+在用量设置区域点击「退出监控进程」，再确认退出并关闭，会先停用自动启动和协调器，关闭当前 Codex，再结束用量监视器与旁支保存后台。退出失败会显示原因并允许重试。退出状态会持久保存，后续登录不会自动恢复；重新运行桌面的 `Codex Usage Monitor` 快捷方式即可再次启用。
+
+运行状态和错误分别记录在：
+
+```text
+%LOCALAPPDATA%\CodexUsageMonitor\runtime-control.json
+%LOCALAPPDATA%\CodexUsageMonitor\runtime-supervisor.json
+%LOCALAPPDATA%\CodexUsageMonitor\runtime-supervisor.log
+%LOCALAPPDATA%\CodexUsageMonitor\shutdown.log
+```
+
+协调器只处理通过当前 Codex 安装入口解析出的主进程，并设有短时间重启次数上限，避免更新或异常状态下循环拉起。
 
 这份本地版本包含 AGPL-3.0 衍生代码，来源和许可见 [NOTICE](NOTICE.md)，用于私人修改与运行。
 
@@ -309,7 +328,7 @@ pwsh -NoProfile -File .\scripts\clear-token-baseline.ps1
 ## 6. 常见问题与排查
 
 1. **点击快捷方式没有反应**：确认 Codex 已正常退出，检查 `node -v` 是否为 22+，然后重新运行 `install.ps1`。
-2. **Codex 启动但没有监视栏**：必须使用 `Codex Usage Monitor` 快捷方式。启动器从 Codex 进程创建时起最多等待 180 秒让 CDP 就绪；重复点击不会重新计时，进程退出后停止等待。若提示启动残留，先正常退出 Codex；如仍有无窗口的残留，请核对错误中的 PID 后手动处理，启动器不会强制结束会话。实际端口及启动阶段记录在 `%LOCALAPPDATA%\CodexUsageMonitor\state.json`。若显示“监视器已断连”，展开面板中的数据是旧数据；已有 CDP 连接时，双击专用快捷方式即可重新连接，无需退出 Codex。
+2. **Codex 启动但没有监视栏**：确认监控进程尚未从设置页退出。监控启用时，协调器检测到原生实例后会执行一次受控重启并将其切换到 CDP 模式。若切换失败，检查 `runtime-supervisor.log`；启动器继续从 Codex 进程创建时起最多等待 180 秒让 CDP 就绪。实际端口及监视器启动阶段记录在 `%LOCALAPPDATA%\CodexUsageMonitor\state.json`。若显示“监视器已断连”，展开面板中的数据是旧数据；已有 CDP 连接时，双击专用快捷方式即可重新连接，无需退出 Codex。
 3. **官方订阅指示灯变红**：当前请求失败但仍有缓存数据，不代表额度耗尽。等待后台自动刷新即可。
 4. **重置概率预测指示灯变红**：Codex Reset Observatory 数据过期或本轮请求失败；它与官方订阅额度无关，等待下一次 5 分钟刷新即可。
 5. **API Key 显示请求受限**：等待 60～300 秒自动退避，避免反复重启或重复保存配置。
@@ -331,7 +350,7 @@ pwsh -NoProfile -File .\scripts\build-release.ps1
 
 ```powershell
 pwsh -NoProfile -File .\scripts\start-monitor.ps1
-pwsh -NoProfile -File .\scripts\restore-monitor.ps1
+pwsh -NoProfile -File .\scripts\restore-monitor.ps1 -DisableRuntime -Reason manual
 node .\scripts\validate-provider.mjs .\config\providers\custom.example.json
 ```
 
@@ -345,7 +364,7 @@ node .\scripts\validate-provider.mjs .\config\providers\custom.example.json
 
 ### 为什么必须使用专用快捷方式？
 
-监视器需要 Codex 启动时开放仅绑定本机的 CDP 端口。原生图标不会开放该端口，因此无法注入。
+监视器需要 Codex 以仅绑定本机的 CDP 端口启动。监控进程启用时，登录协调器会检测原生启动并自动切换到该模式；从设置页退出监控后，协调器不再接管新的 Codex 启动。
 
 ### 是否支持 Microsoft Store 和非 Store 版本？
 

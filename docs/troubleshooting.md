@@ -26,7 +26,15 @@
 
 ## 2. Codex 启动但没有监视栏
 
-必须从桌面的 `Codex Usage Monitor` 快捷方式启动。原生 Codex 图标不会开放 CDP 端口。
+确认监控进程尚未在用量设置中退出。监控启用时，登录协调器会检测原生 Codex 主进程并自动关闭、以 CDP 模式重新启动。协调器的阶段和错误写入 `%LOCALAPPDATA%\CodexUsageMonitor\runtime-supervisor.json` 与 `runtime-supervisor.log`。
+
+升级后仍无插件时，核对 `runtime-supervisor.json` 的 `supervisorPath` 和 `state.json` 的 `injectorPath` 是否指向新版本。3.4.4 起安装器会切换仍在运行的旧协调器；`monitoring` 表示已验证后台心跳，`waiting-ui` 表示尚未连接页面，`monitor-failed` 表示启动失败。超过 180 秒没有有效心跳的后台会被重新启动。
+
+删除旧版本目录不会自动结束它的后台。新版会识别标准安装目录下仍在运行的旧注入进程，在当前后台心跳验证成功后清退这些残留。
+
+### 点击退出后仍未关闭
+
+3.4.5 起退出服务启动失败或执行出错会回传到设置页，并恢复重试按钮。退出过程先禁用自动启动、停止协调器、关闭 Codex，最后结束注入后台。`%LOCALAPPDATA%\CodexUsageMonitor\shutdown.log` 记录退出阶段和错误；页面没有收到服务结果时会超时并允许重试。
 
 启动器最多等待 180 秒让 CDP 就绪。后台进程已运行、页面仍在加载时会保留后台继续重试，不会因面板尚未出现就停止。读取实际动态端口：
 

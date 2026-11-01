@@ -10,9 +10,27 @@ Assert-Startup ((Get-CodexUsageStartupPhase $true $true) -eq 'ready') 'A matchin
 Assert-Startup ((Get-CodexUsageStartupPhase $false $false) -eq 'failed') 'A daemon that exits must fail.'
 Assert-Startup ((Get-CodexUsageStartupPhase $false $true) -eq 'failed') 'A previous heartbeat must not conceal subsequent daemon exit.'
 
+$pendingState = [pscustomobject]@{ startedAt = [DateTimeOffset]::UtcNow.AddSeconds(-200).ToString('o'); startupVerifiedAt = $null }
+Assert-Startup (Test-CodexUsageInjectorStartupExpired $pendingState) 'An unresponsive backend must not be reused forever.'
+$pendingState.startupVerifiedAt = [DateTimeOffset]::UtcNow.ToString('o')
+Assert-Startup (-not (Test-CodexUsageInjectorStartupExpired $pendingState)) 'A recent successful probe must preserve the healthy backend.'
+Assert-Startup (-not (Test-CodexUsageInjectorStartupExpired ([pscustomobject]@{ startedAt = [DateTimeOffset]::UtcNow.ToString('o') }))) 'A newly started backend must retain its renderer loading grace.'
+
+$removedInjector = Join-Path $env:LOCALAPPDATA 'Programs\CodexUsageMonitor\0.0.1\scripts\injector.mjs'
+Assert-Startup (Test-CodexUsageManagedInjectorPath $removedInjector) 'A deleted managed package must not hide its running injector from retirement.'
+Assert-Startup (-not (Test-CodexUsageManagedInjectorPath (Join-Path $env:LOCALAPPDATA 'Programs\OtherApp\0.0.1\scripts\injector.mjs'))) 'Unrelated injector paths must remain outside managed ownership.'
+
 $startupTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-startup-wait-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $startupTestRoot | Out-Null
+$originalRuntimeStateRoot = $CodexUsageStateRoot
 try {
+  $CodexUsageStateRoot = Join-Path $startupTestRoot 'runtime-state'
+  [void](Set-CodexUsageRuntimeControl -Enabled $false -Reason 'test')
+  Assert-Startup (-not (Get-CodexUsageRuntimeControl).enabled) 'Persisted monitor disable state must survive a fresh read.'
+  [void](Set-CodexUsageRuntimeControl -Enabled $true -Reason 'test')
+  Assert-Startup ((Get-CodexUsageRuntimeControl).enabled) 'Monitor re-enable state must survive a fresh read.'
+  $supervisorPath = Get-CodexUsageRuntimeSupervisorPathFromCommandLine '"C:\Program Files\PowerShell\7\pwsh.exe" -File "C:\Codex Usage\scripts\runtime-supervisor.ps1" -Port 9335'
+  Assert-Startup ($supervisorPath -eq 'C:\Codex Usage\scripts\runtime-supervisor.ps1') 'Supervisor process identification must preserve quoted script paths.'
   $emptyPath = Join-Path $startupTestRoot 'empty.log'
   $outputPath = Join-Path $startupTestRoot 'stdout.log'
   [IO.File]::WriteAllText($emptyPath, '')
@@ -33,6 +51,7 @@ try {
   } finally { $shared.Dispose() }
   Assert-Startup ((Read-CodexUsageStartupLog $outputPath 5) -eq 'error') 'Log diagnostics must be bounded.'
 } finally {
+  $CodexUsageStateRoot = $originalRuntimeStateRoot
   # The exact GUID directory above is test-owned; no user state is touched.
   Remove-Item -LiteralPath $startupTestRoot -Recurse -Force
 }
@@ -212,4 +231,51 @@ Assert-Startup (-not (Wait-CodexUsageCdpPort 9335 0 0)) 'A CDP deadline should r
     Assert-Startup ((Resolve-CodexUsageCdpPort 9335) -eq 9335) 'An already-open CDP port must remain reusable regardless of process age.'
   } finally { $env:APPDATA = $originalAppData }
 }
-Write-Host 'PASS: startup wait, pending reuse, safe replacement, and failure diagnostics.'
+# Execute the real shutdown script; mock only process/HTTP boundaries so no
+# running Codex or monitor can be closed by this regression check.
+& {
+  $shutdownTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-shutdown-' + [Guid]::NewGuid().ToString('N'))
+  $previousLocalAppData = $env:LOCALAPPDATA
+  $script:shutdownMainClosed = $false
+  $script:shutdownStopped = [Collections.Generic.List[int]]::new()
+  $fakeMain = [pscustomobject]@{ ProcessId = 65001; ParentProcessId = 0; CreationDate = [DateTime]::UtcNow; ExecutablePath = 'C:\test\ChatGPT.exe'; CommandLine = 'ChatGPT.exe --remote-debugging-port=9335' }
+  $fakeInjector = [pscustomobject]@{ ProcessId = 65002; ParentProcessId = 0; CommandLine = ('node.exe "{0}" --watch --port 9335' -f (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\injector.mjs')) }
+  function Get-CimInstance($ClassName, $Filter, $ErrorAction) {
+    if ($Filter -eq "Name = 'ChatGPT.exe'") { return $fakeMain }
+    if ($Filter -eq "Name = 'node.exe'") { return $fakeInjector }
+    return @()
+  }
+  function Get-Process($Id, $ErrorAction) {
+    if ($Id -eq 65001 -and -not $script:shutdownMainClosed) {
+      $process = [pscustomobject]@{ Id = 65001 }
+      $process | Add-Member ScriptMethod CloseMainWindow {
+        $control = Get-CodexUsageRuntimeControl
+        if ($control.enabled) { throw 'Monitoring must be disabled before closing Codex.' }
+        $script:shutdownMainClosed = $true
+        return $true
+      }
+      return $process
+    }
+    return $null
+  }
+  function Stop-Process($Id, [switch]$Force, $ErrorAction) {
+    if (-not $script:shutdownMainClosed) { throw 'The requesting backend must remain alive until Codex closes.' }
+    $script:shutdownStopped.Add($Id)
+  }
+  try {
+    $env:LOCALAPPDATA = $shutdownTestRoot
+    $shutdownProbe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    try {
+      $shutdownProbe.Start()
+      $unusedPort = ([Net.IPEndPoint]$shutdownProbe.LocalEndpoint).Port
+    } finally { $shutdownProbe.Stop() }
+    . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\restore-monitor.ps1') -Port $unusedPort -DisableRuntime -CloseCodex -Reason test
+    Assert-Startup $script:shutdownMainClosed 'The actual shutdown script must reach Codex closure.'
+    Assert-Startup ($script:shutdownStopped.Contains(65002)) 'The monitor must stop after Codex closes.'
+    Assert-Startup (-not (Get-CodexUsageRuntimeControl).enabled) 'Exit must persist the disabled state.'
+  } finally {
+    $env:LOCALAPPDATA = $previousLocalAppData
+    if (Test-Path -LiteralPath $shutdownTestRoot) { Remove-Item -LiteralPath $shutdownTestRoot -Recurse -Force }
+  }
+}
+Write-Host 'PASS: startup wait, pending reuse, safe replacement, failure diagnostics, and Codex shutdown order.'

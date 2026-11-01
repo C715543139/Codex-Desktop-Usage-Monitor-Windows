@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { backendHeartbeatExpression, backendVerificationExpression, CdpSession, nextEndpointLoss, runOnce } from "../scripts/injector.mjs";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { backendHeartbeatExpression, backendVerificationExpression, CdpSession, createMonitorStopController, nextEndpointLoss, runOnce } from "../scripts/injector.mjs";
 
 const now = Date.now();
 const document = { getElementById: () => ({ shadowRoot: {} }) };
@@ -78,4 +80,75 @@ try {
   console.log = originalLog;
   process.exitCode = originalExitCode;
 }
-console.log("PASS: read-only PID heartbeat verification, slow Composer readiness, endpoint recovery, and stale panel rejection.");
+// Exercise the real shutdown controller through child-process boundaries.
+// A hidden PowerShell failure must reach the UI and release the retry latch.
+{
+  const replies = [], children = [];
+  let prepared = 0;
+  const session = { evaluate: async (expression) => vm.runInNewContext(expression, { window: {
+    __CODEX_USAGE_MONITOR_STATE__: { monitorControlResult: (requestId, result) => { replies.push({ requestId, result }); return true; } },
+  } }) };
+  const stop = createMonitorStopController({
+    prepare: async () => { prepared++; },
+    launch: (_file, args, options) => {
+      assert.equal(prepared, children.length + 1, "disable relaunch before spawning the shutdown helper");
+      assert.ok(args.includes("-ReportProgress"));
+      assert.equal(options.windowsHide, true);
+      assert.equal(options.detached, false);
+      const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), unref() {} });
+      children.push(child);
+      return child;
+    },
+    logError: () => {},
+  });
+  await stop(session, "request-1", 9335);
+  assert.equal(replies.length, 0, "do not report success merely because a child was spawned");
+  assert.equal(await stop(session, "request-1", 9335), false, "a duplicate request must not override the active result");
+  children[0].stdout.write('{"event":"shutdown-started"}\n');
+  await new Promise(setImmediate);
+  assert.equal(replies.at(-1).result.pending, true);
+  children[0].stderr.write("real shutdown error");
+  children[0].emit("close", 1);
+  await new Promise(setImmediate);
+  assert.equal(replies.at(-1).result.ok, false);
+  assert.match(replies.at(-1).result.message, /real shutdown error/);
+  await stop(session, "request-2", 9335);
+  assert.equal(children.length, 2, "a failed helper must allow retry");
+  children[1].stdout.write('{"event":"shutdown-started"}\n');
+  children[1].emit("close", 0);
+  await new Promise(setImmediate);
+  assert.equal(replies.at(-1).result.ok, true);
+  assert.equal(replies.at(-1).result.pending, undefined);
+}
+// Check the Windows PowerShell launch/stdio boundary as well as the controller.
+// This helper emits only a protocol marker and an error; it never calls Codex.
+if (process.platform === "win32") {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const os = await import("node:os");
+  const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "codex-shutdown-protocol-"));
+  const originalLocalAppData = process.env.LOCALAPPDATA;
+  try {
+    process.env.LOCALAPPDATA = scratch;
+    const controlPath = path.join(scratch, "CodexUsageMonitor", "runtime-control.json");
+    await fs.mkdir(path.dirname(controlPath));
+    await fs.writeFile(controlPath, JSON.stringify({ enabled: true }), "utf8");
+    const script = path.join(scratch, "shutdown-probe.ps1");
+    await fs.writeFile(script, '\ufeff[Console]::Out.WriteLine(\'{"event":"shutdown-started"}\')\nthrow "shutdown-protocol-probe"\n', "utf8");
+    let receive;
+    const response = new Promise((resolve) => { receive = resolve; });
+    const stop = createMonitorStopController({ script, logError: () => {} });
+    await stop({ evaluate: async (expression) => vm.runInNewContext(expression, { window: {
+      __CODEX_USAGE_MONITOR_STATE__: { monitorControlResult: (_id, result) => { if (!result.pending) receive(result); return true; } },
+    } }) }, "process-launch-probe", 9335);
+    const result = await response;
+    assert.equal(result.ok, false);
+    assert.match(result.message, /shutdown-protocol-probe/);
+    assert.equal(JSON.parse(await fs.readFile(controlPath, "utf8")).enabled, false, "disable state must persist even when the actual PowerShell helper fails");
+  } finally {
+    if (originalLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = originalLocalAppData;
+    await fs.rm(scratch, { recursive: true, force: true });
+  }
+}
+console.log("PASS: read-only backend verification, endpoint recovery, and shutdown service failure/retry reporting.");

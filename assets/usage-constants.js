@@ -1,7 +1,7 @@
 (() => {
   const registry = window.__CODEX_USAGE_MONITOR_MODULES__ ||= {};
   registry.constants = Object.freeze({
-    VERSION: "3.3.0",
+    VERSION: "3.4.5",
     STATE_KEY: "__CODEX_USAGE_MONITOR_STATE__",
     USAGE_KEY: "__CODEX_USAGE_MONITOR__",
     HOST_ID: "codex-usage-monitor",
@@ -11,6 +11,7 @@
     SETTINGS_BINDING: "__codexUsageMonitorSaveSettings",
     CONFIGURATION_KEY: "__CODEX_USAGE_MONITOR_CONFIGURATION__",
     CONFIGURATION_BINDING: "__codexUsageMonitorConfigureSource",
+    MONITOR_CONTROL_BINDING: "__codexUsageMonitorControl",
     REFRESH_INTERVAL_MS: 60000,
     LAYOUT_FALLBACK_INTERVAL_MS: 20000,
     COUNTDOWN_INTERVAL_MS: 1000,

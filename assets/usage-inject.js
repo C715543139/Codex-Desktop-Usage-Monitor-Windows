@@ -5,7 +5,7 @@
   }
   const {
     VERSION, STATE_KEY, USAGE_KEY, HOST_ID, SETTINGS_KEY, PREVIOUS_SETTINGS_KEY,
-    PERSISTED_SETTINGS_KEY, SETTINGS_BINDING, CONFIGURATION_KEY, CONFIGURATION_BINDING,
+    PERSISTED_SETTINGS_KEY, SETTINGS_BINDING, CONFIGURATION_KEY, CONFIGURATION_BINDING, MONITOR_CONTROL_BINDING,
     REFRESH_INTERVAL_MS, LAYOUT_FALLBACK_INTERVAL_MS, COUNTDOWN_INTERVAL_MS,
     PLACEMENT_DEBOUNCE_MS, MAX_SELECTED_METRICS,
     MAX_MINIMAL_SELECTED_METRICS,
@@ -918,6 +918,33 @@
     }
     .usage-settings-trigger:hover { background: color-mix(in srgb, currentColor 8%, transparent); }
     .usage-settings-trigger:focus-visible { outline: 2px solid color-mix(in srgb, currentColor 42%, transparent); outline-offset: 1px; }
+    .usage-process-control {
+      display: grid;
+      gap: 5px;
+      width: 100%;
+      padding: 7px 0 5px;
+      border-top: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+      font-size: 9px;
+      line-height: 1.45;
+    }
+    .usage-process-control[hidden] { display: none; }
+    .usage-process-control-title { font-weight: 700; }
+    .usage-process-control-description { opacity: .68; }
+    .usage-process-control-actions { display: flex; justify-content: flex-end; gap: 6px; }
+    .usage-process-control button {
+      min-height: 24px;
+      padding: 2px 7px;
+      border: 1px solid color-mix(in srgb, currentColor 34%, transparent);
+      border-radius: 5px;
+      color: inherit;
+      background: transparent;
+      font: inherit;
+      cursor: pointer;
+    }
+    .usage-process-control button[data-monitor-control-action="confirm"] { border-color: #dc6b6b; color: #dc6b6b; }
+    .usage-process-control button:disabled { cursor: wait; opacity: .55; }
+    .usage-process-control-status { color: #b45309; }
+    .usage-process-control-status[data-kind="success"] { color: #15803d; }
     @media (max-width: 760px) {
       .usage-popover { padding-inline: 8px; font-size: 10px; }
       .usage-column { padding-inline: 6px; }
@@ -1544,6 +1571,45 @@
             switches.append(toggle);
           }
           switches.hidden = host.dataset.settingsOpen !== "true";
+          const processControl = document.createElement("div");
+          processControl.className = "usage-process-control";
+          processControl.hidden = host.dataset.settingsOpen !== "true";
+          const processTitle = document.createElement("div");
+          processTitle.className = "usage-process-control-title";
+          processTitle.textContent = t("monitorProcess");
+          const processDescription = document.createElement("div");
+          processDescription.className = "usage-process-control-description";
+          processDescription.textContent = t("monitorProcessDescription");
+          const processActions = document.createElement("div");
+          processActions.className = "usage-process-control-actions";
+          const monitorControl = window[STATE_KEY]?.monitorControl;
+          if (monitorControl?.confirming) {
+            const cancel = document.createElement("button");
+            cancel.type = "button";
+            cancel.dataset.monitorControlAction = "cancel";
+            cancel.textContent = t("exitMonitorCancel");
+            cancel.disabled = Boolean(monitorControl.pending);
+            const confirm = document.createElement("button");
+            confirm.type = "button";
+            confirm.dataset.monitorControlAction = "confirm";
+            confirm.textContent = monitorControl.pending ? t("exitMonitorStopping") : t("exitMonitorConfirm");
+            confirm.disabled = Boolean(monitorControl.pending);
+            processActions.append(cancel, confirm);
+          } else {
+            const exit = document.createElement("button");
+            exit.type = "button";
+            exit.dataset.monitorControlAction = "request";
+            exit.textContent = monitorControl?.pending ? t("exitMonitorStopping") : t("exitMonitorProcess");
+            exit.disabled = Boolean(monitorControl?.pending);
+            exit.title = t("exitMonitorDescription");
+            processActions.append(exit);
+          }
+          const processStatus = document.createElement("div");
+          processStatus.className = "usage-process-control-status";
+          processStatus.dataset.kind = monitorControl?.status?.kind || "idle";
+          processStatus.setAttribute("role", monitorControl?.status?.kind === "error" ? "alert" : "status");
+          processStatus.textContent = monitorControl?.status?.message || "";
+          processControl.append(processTitle, processDescription, processActions, processStatus);
           const meta = document.createElement("div");
           meta.className = "usage-column-meta";
           const settingsTrigger = document.createElement("button");
@@ -1563,7 +1629,7 @@
           countdown.className = "usage-refresh-countdown";
           countdown.textContent = t("refreshIn", { seconds: "--" });
           meta.append(settingsTrigger, maximum, separator, countdown);
-          footer.append(switches, meta);
+          footer.append(switches, processControl, meta);
           column.append(footer);
 
           const brand = document.createElement("div");
@@ -1636,6 +1702,49 @@
         toggleSummary();
       });
       host.shadowRoot.addEventListener("click", (event) => {
+        const monitorControlAction = event.target?.closest?.("[data-monitor-control-action]")?.dataset.monitorControlAction;
+        if (monitorControlAction) {
+          const state = window[STATE_KEY];
+          if (!state?.monitorControl || state.monitorControl.pending) return;
+          const t = createTranslator(loadSettings().englishUi ? "en" : "zh");
+          if (monitorControlAction === "request") {
+            state.monitorControl.confirming = true;
+            state.monitorControl.status = { kind: "idle", message: "" };
+          } else if (monitorControlAction === "cancel") {
+            state.monitorControl.confirming = false;
+            state.monitorControl.status = { kind: "idle", message: "" };
+          } else if (monitorControlAction === "confirm") {
+            const controlBinding = typeof window[MONITOR_CONTROL_BINDING] === "function"
+              ? window[MONITOR_CONTROL_BINDING]
+              : window[SETTINGS_BINDING];
+            if (typeof controlBinding !== "function") {
+              state.monitorControl.confirming = false;
+              state.monitorControl.status = { kind: "error", message: t("exitMonitorUnavailable") };
+            } else {
+              const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+              state.monitorControl.pending = requestId;
+              state.monitorControl.status = { kind: "idle", message: t("exitMonitorStopping") };
+              state.monitorControl.timeout = setTimeout(() => {
+                if (window[STATE_KEY] !== state || state.monitorControl.pending !== requestId) return;
+                state.monitorControl.pending = null;
+                state.monitorControl.confirming = false;
+                state.monitorControl.timeout = null;
+                state.monitorControl.status = { kind: "error", message: t("exitMonitorTimedOut") };
+                render(host, state.usage, true);
+              }, 30000);
+              try { controlBinding(JSON.stringify({ requestId, action: "stop-monitor" })); }
+              catch {
+                clearTimeout(state.monitorControl.timeout);
+                state.monitorControl.timeout = null;
+                state.monitorControl.pending = null;
+                state.monitorControl.confirming = false;
+                state.monitorControl.status = { kind: "error", message: t("exitMonitorUnavailable") };
+              }
+            }
+          }
+          render(host, window[STATE_KEY]?.usage || window[USAGE_KEY], true);
+          return;
+        }
         const settingsTrigger = event.target?.closest?.("[data-toggle-settings]");
         if (settingsTrigger) {
           host.dataset.settingsOpen = String(host.dataset.settingsOpen !== "true");
@@ -1888,6 +1997,12 @@
       pending: null,
       status: { sourceId: null, kind: "idle", message: "" },
     },
+    monitorControl: {
+      confirming: false,
+      pending: null,
+      timeout: null,
+      status: { kind: "idle", message: "" },
+    },
     ensure,
     diagnose() { return { ...this.health }; },
     getSettings() { return loadSettings(); },
@@ -1915,6 +2030,23 @@
       if (host) render(host, usage);
       return true;
     },
+    monitorControlResult(requestId, result) {
+      if (!this.monitorControl.pending || requestId !== this.monitorControl.pending) return false;
+      const t = createTranslator(loadSettings().englishUi ? "en" : "zh");
+      const pending = result?.ok === true && result?.pending === true;
+      if (!pending) {
+        clearTimeout(this.monitorControl.timeout);
+        this.monitorControl.timeout = null;
+        this.monitorControl.pending = null;
+      }
+      this.monitorControl.confirming = false;
+      this.monitorControl.status = result?.ok
+        ? { kind: pending ? "idle" : "success", message: t("exitMonitorStopping") }
+        : { kind: "error", message: typeof result?.message === "string" ? result.message.slice(0, 240) : t("exitMonitorFailed") };
+      const host = ensure();
+      if (host) render(host, this.usage, true);
+      return true;
+    },
     configurationResult(requestId, result) {
       if (!this.configuration.pending || requestId !== this.configuration.pending) return false;
       const sourceId = this.configuration.openSourceId;
@@ -1936,6 +2068,7 @@
       return true;
     },
     cleanup() {
+      clearTimeout(this.monitorControl?.timeout);
       for (const draft of Object.values(this.configuration?.drafts || {})) {
         if (draft && typeof draft === "object") { draft.token = ""; draft.apiKey = ""; }
       }

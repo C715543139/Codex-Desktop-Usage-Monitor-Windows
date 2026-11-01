@@ -93,6 +93,8 @@ try {
   $installedRoot = Join-Path $InstallRoot $Version
   if (-not (Test-Path -LiteralPath (Join-Path $installedRoot 'scripts\start-monitor.ps1') -PathType Leaf)) { throw 'Installed update could not be verified.' }
   Write-UpdateState 'installed'
+  . (Join-Path $installedRoot 'scripts\monitor-utils.ps1')
+  if ((Get-CodexUsageRuntimeControl).enabled) { [void](Start-CodexUsageRuntimeSupervisor -Port $Port) }
   $pwsh = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
   if (-not $pwsh) { $pwsh = (Get-Command powershell.exe -ErrorAction Stop).Source }
   Start-Process -FilePath $pwsh -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f (Join-Path $installedRoot 'scripts\start-monitor.ps1')),'-Port',"$Port",'-Replace') -WindowStyle Hidden
