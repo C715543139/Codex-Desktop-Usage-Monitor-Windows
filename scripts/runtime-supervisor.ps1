@@ -81,11 +81,7 @@ function Start-CodexUsageSupervisedMonitor([int]$CandidatePort) {
   return [ordered]@{ phase = 'waiting-ui'; port = $CandidatePort; injectorPid = $runtimeState.injectorPid }
 }
 
-try {
-  try { $mutexAcquired = $mutex.WaitOne([TimeSpan]::FromSeconds(5)) }
-  catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
-  if (-not $mutexAcquired) { Write-CodexUsageSupervisorLog '另一个运行时协调器已在运行。'; return }
-
+function Invoke-CodexUsageSupervision {
   $control = Get-CodexUsageRuntimeControl
   if (-not $control.enabled) {
     Write-CodexUsageSupervisorState ([ordered]@{ phase = 'disabled'; port = $Port })
@@ -93,6 +89,7 @@ try {
   }
 
   $handled = [Collections.Generic.HashSet[string]]::new()
+  $managed = [Collections.Generic.HashSet[string]]::new()
   $handoffTimes = [Collections.Generic.Queue[DateTime]]::new()
   $lastMonitorAttempts = @{}
   $monitorStates = @{}
@@ -106,6 +103,18 @@ try {
       Write-CodexUsageSupervisorLog '监控进程已禁用，协调器退出。'
       Write-CodexUsageSupervisorState ([ordered]@{ phase = 'disabled'; port = $Port })
       break
+    }
+
+    # Inspect process generations before probing pages. A closing desktop can
+    # lose every renderer while its main process is still alive.
+    $mains = @(Get-CodexUsageMainCodexProcesses | Sort-Object CreationDate -Descending)
+    if (-not $mains.Count) {
+      if (([DateTime]::UtcNow - $lastIdleWrite).TotalSeconds -ge 30) {
+        $lastIdleWrite = [DateTime]::UtcNow
+        Write-CodexUsageSupervisorState ([ordered]@{ phase = 'waiting-for-codex'; port = $Port })
+      }
+      Start-Sleep -Milliseconds $PollMilliseconds
+      continue
     }
 
     $activePort = 0
@@ -126,12 +135,23 @@ try {
       continue
     }
 
-    $mains = @(Get-CodexUsageMainCodexProcesses | Sort-Object CreationDate -Descending)
-    if (-not $mains.Count) {
-      if (([DateTime]::UtcNow - $lastIdleWrite).TotalSeconds -ge 30) {
-        $lastIdleWrite = [DateTime]::UtcNow
-        Write-CodexUsageSupervisorState ([ordered]@{ phase = 'waiting-for-codex'; port = $Port })
+    $managedMains = @($mains | Where-Object {
+      $_.HasCdpArgument -or ($_.CreationDate -and $managed.Contains("$($_.ProcessId):$(([DateTime]$_.CreationDate).ToUniversalTime().Ticks)"))
+    })
+    if ($managedMains.Count) {
+      $candidate = $managedMains[0]
+      $phase = 'cdp-unavailable'
+      if ($candidate.CreationDate -and ([DateTime]::UtcNow - ([DateTime]$candidate.CreationDate).ToUniversalTime()).TotalSeconds -lt $CdpStartupTimeoutSeconds) {
+        $phase = 'waiting-cdp'
       }
+      # An explicit CDP launch is never a native-launch handoff candidate,
+      # regardless of its age, a slow renderer, or normal application exit.
+      Write-CodexUsageSupervisorState ([ordered]@{ phase = $phase; port = $Port; codexPid = $candidate.ProcessId })
+      Start-Sleep -Milliseconds $PollMilliseconds
+      continue
+    }
+    if ($mains.Count -ne 1) {
+      Write-CodexUsageSupervisorState ([ordered]@{ phase = 'waiting-native-start'; port = $Port })
       Start-Sleep -Milliseconds $PollMilliseconds
       continue
     }
@@ -150,58 +170,70 @@ try {
       Start-Sleep -Milliseconds $PollMilliseconds
       continue
     }
-    if ($candidate.HasCdpArgument -and $ageMilliseconds -lt ($CdpStartupTimeoutSeconds * 1000)) {
-      Write-CodexUsageSupervisorState ([ordered]@{ phase = 'waiting-cdp'; port = $Port; codexPid = $candidate.ProcessId })
-      Start-Sleep -Milliseconds $PollMilliseconds
-      continue
-    }
-
-    $handled.Add($fingerprint) | Out-Null
     $cutoff = [DateTime]::UtcNow.AddSeconds(-$HandoffWindowSeconds)
     while ($handoffTimes.Count -gt 0 -and $handoffTimes.Peek() -lt $cutoff) { [void]$handoffTimes.Dequeue() }
     if ($handoffTimes.Count -ge $MaxHandoffsPerWindow) {
+      [void]$handled.Add($fingerprint)
       Write-CodexUsageSupervisorLog "最近 $HandoffWindowSeconds 秒内已尝试 $($handoffTimes.Count) 次交接，停止循环重启。"
       Write-CodexUsageSupervisorState ([ordered]@{ phase = 'restart-budget-exhausted'; port = $Port; codexPid = $candidate.ProcessId })
       Start-Sleep -Milliseconds $PollMilliseconds
       continue
     }
-    $handoffTimes.Enqueue([DateTime]::UtcNow)
-    Write-CodexUsageSupervisorLog "检测到无 CDP 的 Codex 主进程 PID $($candidate.ProcessId)，开始交接。"
-    Write-CodexUsageSupervisorState ([ordered]@{ phase = 'restarting-native-codex'; port = $Port; codexPid = $candidate.ProcessId })
-
     try {
-      if (Test-CodexUsageMainProcessIdentity $candidate) {
-        $process = Get-Process -Id $candidate.ProcessId -ErrorAction Stop
-        try { [void]$process.CloseMainWindow() } catch {}
-        if (-not (Wait-CodexUsageMainProcessExit $candidate.ProcessId $CloseTimeoutSeconds)) {
-          Write-CodexUsageSupervisorLog "PID $($candidate.ProcessId) 未在正常关闭期限内退出，结束该 Codex 进程树。"
-          Stop-CodexUsageCodexProcessGeneration -RootProcessIds @($candidate.ProcessId)
-          if (-not (Wait-CodexUsageMainProcessExit $candidate.ProcessId 5)) {
-            throw "无法结束原生 Codex 进程 PID $($candidate.ProcessId)"
-          }
-        } else {
+      if (-not (Get-CodexUsageRuntimeControl).enabled) { continue }
+      if (-not (Test-CodexUsageMainProcessIdentity $candidate)) {
+        [void]$handled.Add($fingerprint)
+        Write-CodexUsageSupervisorLog '原生 Codex 已退出或进程身份已变化，取消交接。'
+        continue
+      }
+      $process = Get-Process -Id $candidate.ProcessId -ErrorAction Stop
+      $process.Refresh()
+      if ($process.MainWindowHandle -eq [IntPtr]::Zero) {
+        # A native launch must expose a window before handoff. A process with
+        # no window can also be a normal quit in progress; never resurrect it.
+        Write-CodexUsageSupervisorState ([ordered]@{ phase = 'waiting-native-window'; port = $Port; codexPid = $candidate.ProcessId })
+        Start-Sleep -Milliseconds $PollMilliseconds
+        continue
+      }
+      [void]$handled.Add($fingerprint)
+      if (-not $process.CloseMainWindow()) {
+        Write-CodexUsageSupervisorLog 'Codex 窗口已关闭，取消交接。'
+        continue
+      }
+      $handoffTimes.Enqueue([DateTime]::UtcNow)
+      Write-CodexUsageSupervisorLog "检测到原生 Codex 主进程 PID $($candidate.ProcessId)，开始单次交接。"
+      Write-CodexUsageSupervisorState ([ordered]@{ phase = 'restarting-native-codex'; port = $Port; codexPid = $candidate.ProcessId })
+      if (-not (Wait-CodexUsageMainProcessExit $candidate.ProcessId $CloseTimeoutSeconds)) {
+        Write-CodexUsageSupervisorLog "PID $($candidate.ProcessId) 未在正常关闭期限内退出，结束该 Codex 进程树。"
+        if (Test-CodexUsageMainProcessIdentity $candidate) {
           Stop-CodexUsageCodexProcessGeneration -RootProcessIds @($candidate.ProcessId)
         }
-      } else {
-        Write-CodexUsageSupervisorLog '原生 Codex 进程身份已变化，跳过本次交接。'
+        if (-not (Wait-CodexUsageMainProcessExit $candidate.ProcessId 5)) {
+          throw "无法结束原生 Codex 进程 PID $($candidate.ProcessId)"
+        }
       }
-
+      if (-not (Get-CodexUsageRuntimeControl).enabled) { continue }
       $launchPort = Resolve-CodexUsageAvailablePort -PreferredPort $Port
       $launch = Start-CodexUsagePackagedCodex -Port $launchPort
-      Write-CodexUsageSupervisorState ([ordered]@{ phase = 'waiting-cdp-after-restart'; port = $launchPort; codexPid = $launch.ProcessId })
-      if (-not (Wait-CodexUsageCdpPort -Port $launchPort -ProcessId $launch.ProcessId -TimeoutSeconds $CdpStartupTimeoutSeconds)) {
-        throw "带 CDP 的 Codex 未在 $CdpStartupTimeoutSeconds 秒内就绪（PID $($launch.ProcessId)）"
+      $launchPort = $launch.Port
+      foreach ($launched in @(Get-CodexUsageMainCodexProcesses | Where-Object { $_.ProcessId -eq $launch.ProcessId -and $_.CreationDate })) {
+        [void]$managed.Add("$($launched.ProcessId):$(([DateTime]$launched.CreationDate).ToUniversalTime().Ticks)")
       }
-      $lastMonitorAttempts[$launchPort] = [DateTime]::UtcNow
-      Write-CodexUsageSupervisorLog "Codex 已切换为带 CDP 模式，端口 $launchPort。"
-      $monitorStates[$launchPort] = Start-CodexUsageSupervisedMonitor $launchPort
-      Write-CodexUsageSupervisorState $monitorStates[$launchPort]
+      Write-CodexUsageSupervisorLog "已启动带 CDP 的 Codex，PID $($launch.ProcessId)，端口 $launchPort；等待页面，不再重启此实例。"
+      Write-CodexUsageSupervisorState ([ordered]@{ phase = 'waiting-cdp-after-restart'; port = $launchPort; codexPid = $launch.ProcessId })
     } catch {
       Write-CodexUsageSupervisorLog "Codex 交接失败：$($_.Exception.Message)"
       Write-CodexUsageSupervisorState ([ordered]@{ phase = 'restart-failed'; port = $Port; codexPid = $candidate.ProcessId; message = $_.Exception.Message })
     }
     Start-Sleep -Milliseconds $PollMilliseconds
   }
+}
+
+try {
+  try { $mutexAcquired = $mutex.WaitOne([TimeSpan]::FromSeconds(5)) }
+  catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
+  if (-not $mutexAcquired) { Write-CodexUsageSupervisorLog '另一个运行时协调器已在运行。'; return }
+  Invoke-CodexUsageSupervision
 } catch {
   Write-CodexUsageSupervisorLog "协调器异常：$($_.Exception.Message)"
   Write-CodexUsageSupervisorState ([ordered]@{ phase = 'failed'; port = $Port; message = $_.Exception.Message })

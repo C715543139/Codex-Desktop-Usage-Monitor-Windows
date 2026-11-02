@@ -28,6 +28,8 @@
 
 确认监控进程尚未在用量设置中退出。监控启用时，登录协调器会检测原生 Codex 主进程并自动关闭、以 CDP 模式重新启动。协调器的阶段和错误写入 `%LOCALAPPDATA%\CodexUsageMonitor\runtime-supervisor.json` 与 `runtime-supervisor.log`。
 
+3.4.6 起每个原生实例只交接一次。带 CDP 的实例在退出或页面暂不可用时不会重启；`cdp-unavailable` 表示保留进程等待连接，`waiting-for-codex` 表示等待下次手动启动。若原生进程自行退出或窗口已经关闭，交接会取消。快捷方式与协调器同时启动时复用同一个桌面实例。
+
 升级后仍无插件时，核对 `runtime-supervisor.json` 的 `supervisorPath` 和 `state.json` 的 `injectorPath` 是否指向新版本。3.4.4 起安装器会切换仍在运行的旧协调器；`monitoring` 表示已验证后台心跳，`waiting-ui` 表示尚未连接页面，`monitor-failed` 表示启动失败。超过 180 秒没有有效心跳的后台会被重新启动。
 
 删除旧版本目录不会自动结束它的后台。新版会识别标准安装目录下仍在运行的旧注入进程，在当前后台心跳验证成功后清退这些残留。

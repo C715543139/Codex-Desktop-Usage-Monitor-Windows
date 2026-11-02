@@ -8,8 +8,9 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'monitor-utils.ps1')
 
-function Get-CodexMonitorLaunchPlan([bool]$DebugReady, [bool]$CodexRunning) {
+function Get-CodexMonitorLaunchPlan([bool]$DebugReady, [bool]$CodexRunning, [bool]$HasCdpProcess = $false) {
   if ($DebugReady) { return 'reuse-codex' }
+  if ($HasCdpProcess) { return 'wait-cdp' }
   if ($CodexRunning) { return 'restart-native-codex' }
   return 'launch-codex'
 }
@@ -24,6 +25,7 @@ if ($SelfTest) {
   foreach ($case in $cases) {
     if ((Get-CodexMonitorLaunchPlan $case.DebugReady $case.CodexRunning) -ne $case.Expected) { throw '监视器启动决策测试失败。' }
   }
+  if ((Get-CodexMonitorLaunchPlan $false $true $true) -ne 'wait-cdp') { throw '已有 CDP 进程时应等待页面，不重复启动或交接。' }
   $injectorPath = Join-Path $PSScriptRoot 'injector.mjs'
   $injectorProcess = [pscustomobject]@{ ProcessId = 42; InjectorPath = $injectorPath }
   $legacyState = [pscustomobject]@{ injectorPid = 42; injectorPath = $injectorPath }
@@ -67,21 +69,29 @@ function Write-CodexMonitorLaunchError([string]$Message) {
 try {
   [void](Set-CodexUsageRuntimeControl -Enabled $true -Reason 'launcher')
   [void](Start-CodexUsageRuntimeSupervisor -Port $Port)
-  $codexRunning = @(Get-CodexUsageMainCodexProcesses).Count -gt 0
+  $mains = @(Get-CodexUsageMainCodexProcesses)
+  $codexRunning = $mains.Count -gt 0
+  $hasCdpProcess = @($mains | Where-Object { $_.HasCdpArgument }).Count -gt 0
   $activePort = if ($codexRunning) { Resolve-CodexUsageCdpPort $Port } else { 0 }
   $debugReady = [bool]$activePort
-  if ($codexRunning -and -not $debugReady) {
-    # A process launched with CDP can exist well before its renderer is ready.
-    try { $activePort = Wait-CodexUsagePendingCdpPort } catch { $activePort = 0 }
-    $debugReady = [bool]$activePort
+  $plan = Get-CodexMonitorLaunchPlan $debugReady $codexRunning $hasCdpProcess
+  if ($plan -eq 'wait-cdp') {
+    # A timeout or normal quit must never turn a CDP launch into a native one.
+    $activePort = Wait-CodexUsagePendingCdpPort
+    if (-not $activePort) { return }
+    $debugReady = $true
   }
-  $plan = Get-CodexMonitorLaunchPlan $debugReady $codexRunning
   if ($plan -eq 'restart-native-codex') {
-    $deadline = (Get-Date).AddSeconds(45)
+    $deadline = (Get-Date).AddSeconds(180)
     do {
       Start-Sleep -Milliseconds 500
       $activePort = Resolve-CodexUsageCdpPort $Port
       if ($activePort) { break }
+      $runtimeControl = Get-CodexUsageRuntimeControl
+      if (-not $runtimeControl.enabled) { return }
+      $statusPath = Join-Path $CodexUsageStateRoot 'runtime-supervisor.json'
+      try { $supervisorState = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json } catch { $supervisorState = $null }
+      if ($supervisorState -and $supervisorState.phase -eq 'waiting-for-codex' -and -not @(Get-CodexUsageMainCodexProcesses).Count) { return }
     } while ((Get-Date) -lt $deadline)
     if (-not $activePort) {
       throw '运行时协调器未能将原生 Codex 切换为带监视插件的模式。请查看 runtime-supervisor.log。'
@@ -92,6 +102,7 @@ try {
   if (-not $debugReady) {
     $Port = Resolve-CodexUsageAvailablePort -PreferredPort $Port
     $launch = Start-CodexUsagePackagedCodex -Port $Port
+    $Port = $launch.Port
     if (-not (Wait-CodexUsageCdpPort -Port $Port -ProcessId $launch.ProcessId)) { throw "Codex 调试端口 $Port 未就绪（PID $($launch.ProcessId)）；启动进程已退出或超过 180 秒启动期限，可能存在启动残留。请查看 runtime-supervisor.log。" }
   }
   & (Join-Path $PSScriptRoot 'start-monitor.ps1') -Port $Port

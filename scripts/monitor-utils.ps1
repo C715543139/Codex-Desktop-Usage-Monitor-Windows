@@ -876,6 +876,34 @@ function Resolve-CodexUsageCdpPort {
 
 function Start-CodexUsagePackagedCodex {
   [CmdletBinding()]
+  param([Parameter(Mandatory = $true)][ValidateRange(1024, 65535)][int]$Port)
+  # The shortcut and supervisor can reach process creation together. Serialize
+  # that boundary and reuse the existing generation before starting another.
+  $desktopMutex = [Threading.Mutex]::new($false, 'Local\CodexUsageDesktopLaunch')
+  $desktopAcquired = $false
+  try {
+    try { $desktopAcquired = $desktopMutex.WaitOne([TimeSpan]::FromSeconds(30)) }
+    catch [Threading.AbandonedMutexException] { $desktopAcquired = $true }
+    if (-not $desktopAcquired) { throw '另一个 Codex 启动操作仍在进行。' }
+    $existing = @(Get-CodexUsageMainCodexProcesses)
+    foreach ($process in $existing) {
+      if ($process.HasCdpArgument -and $process.CommandLine -match '--remote-debugging-port(?:=|\s+)(\d+)') {
+        $existingPort = [int]$Matches[1]
+        if ($existingPort -ge 1024 -and $existingPort -le 65535) {
+          return [pscustomobject]@{ ProcessId = $process.ProcessId; Port = $existingPort; AppUserModelId = $null }
+        }
+      }
+    }
+    if ($existing.Count) { throw 'Codex 原生实例仍在运行，等待协调器完成交接后再试。' }
+    return Start-CodexUsageDesktopProcess -Port $Port
+  } finally {
+    if ($desktopAcquired) { try { $desktopMutex.ReleaseMutex() } catch {} }
+    $desktopMutex.Dispose()
+  }
+}
+
+function Start-CodexUsageDesktopProcess {
+  [CmdletBinding()]
   param(
     [Parameter(Mandatory = $true)]
     [ValidateRange(1024, 65535)]

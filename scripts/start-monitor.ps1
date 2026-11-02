@@ -63,6 +63,7 @@ if (-not $activePort) {
     throw 'Codex 已经运行但未开放 CDP。请正常退出后再使用监视器启动器；脚本不会强制结束现有会话。'
   }
   $launch = Start-CodexUsagePackagedCodex -Port $Port
+  $Port = $launch.Port
   if (-not (Wait-CodexUsageCdpPort -Port $Port -ProcessId $launch.ProcessId)) { throw "Codex 调试端口 $Port 未就绪（PID $($launch.ProcessId)）；启动进程已退出或超过 180 秒启动期限，可能存在启动残留。脚本未结束 Codex，请正常退出后重试。" }
   $activePort = $Port
 }

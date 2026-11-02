@@ -278,4 +278,97 @@ Assert-Startup (-not (Wait-CodexUsageCdpPort 9335 0 0)) 'A CDP deadline should r
     if (Test-Path -LiteralPath $shutdownTestRoot) { Remove-Item -LiteralPath $shutdownTestRoot -Recurse -Force }
   }
 }
-Write-Host 'PASS: startup wait, pending reuse, safe replacement, failure diagnostics, and Codex shutdown order.'
+# Run the real supervisor loop with process/port snapshots. These scenarios
+# never open, close or restart the user's desktop.
+& {
+  $supervisorPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\runtime-supervisor.ps1'
+  $tokens = $null
+  $errors = $null
+  $ast = [Management.Automation.Language.Parser]::ParseFile($supervisorPath, [ref]$tokens, [ref]$errors)
+  foreach ($name in @('Test-CodexUsageMainProcessIdentity', 'Invoke-CodexUsageSupervision')) {
+    $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+    . ([scriptblock]::Create($definition.Extent.Text))
+  }
+  $Port = 9335
+  $PollMilliseconds = 0
+  $NativeGraceMilliseconds = 0
+  $CdpStartupTimeoutSeconds = 1
+  $CloseTimeoutSeconds = 1
+  $MaxHandoffsPerWindow = 2
+  $HandoffWindowSeconds = 300
+  $MonitorRetrySeconds = 20
+  function Write-CodexUsageSupervisorLog($Message) {}
+  function Write-CodexUsageSupervisorState($State) { $script:supervisionStates.Add($State.phase) }
+  function Start-Sleep($Milliseconds) { $script:supervisionFrame++ }
+  function Get-CodexUsageRuntimeControl { return [pscustomobject]@{ enabled = $script:supervisionFrame -lt $script:supervisionFrames.Count } }
+  function Get-CodexUsageMainCodexProcesses {
+    if ($script:launchedInFrame -eq $script:supervisionFrame) { return $script:replacement }
+    return $script:supervisionFrames[$script:supervisionFrame].Mains
+  }
+  function Resolve-CodexUsageCdpPort($Port) { if ($script:supervisionFrames[$script:supervisionFrame].Ready) { return 9335 }; return 0 }
+  function Get-CimInstance($ClassName, $Filter, $ErrorAction) {
+    if ($script:identityChanged) { return $null }
+    return Get-CodexUsageMainCodexProcesses | Where-Object { $Filter -eq "ProcessId = $($_.ProcessId)" }
+  }
+  function Get-Process($Id, $ErrorAction) {
+    $process = [pscustomobject]@{ MainWindowHandle = [IntPtr]$script:nativeWindow }
+    $process | Add-Member ScriptMethod Refresh {}
+    $process | Add-Member ScriptMethod CloseMainWindow { $script:supervisionCloses++; return $script:closeAccepted }
+    return $process
+  }
+  function Wait-CodexUsageMainProcessExit($ProcessId, $TimeoutSeconds) { return $true }
+  function Stop-CodexUsageCodexProcessGeneration { throw 'These scenarios must not force-stop a process.' }
+  function Resolve-CodexUsageAvailablePort($PreferredPort) { return $PreferredPort }
+  function Start-CodexUsagePackagedCodex($Port) {
+    $script:supervisionLaunches++
+    $script:launchedInFrame = $script:supervisionFrame
+    return [pscustomobject]@{ ProcessId = $script:replacement.ProcessId; Port = $Port }
+  }
+  function Start-CodexUsageSupervisedMonitor($CandidatePort) { return [ordered]@{ phase = 'monitoring'; port = $CandidatePort } }
+  function Invoke-SupervisionScenario($Frames, $Replacement = $null, [int]$Window = 1, [bool]$CloseAccepted = $true, [bool]$IdentityChanged = $false) {
+    $script:supervisionFrames = $Frames
+    $script:supervisionFrame = 0
+    $script:replacement = $Replacement
+    $script:launchedInFrame = -1
+    $script:nativeWindow = $Window
+    $script:closeAccepted = $CloseAccepted
+    $script:identityChanged = $IdentityChanged
+    $script:supervisionLaunches = 0
+    $script:supervisionCloses = 0
+    $script:supervisionStates = [Collections.Generic.List[string]]::new()
+    Invoke-CodexUsageSupervision
+  }
+  $native = [pscustomobject]@{ ProcessId = 701; CreationDate = [DateTime]::UtcNow.AddMinutes(-5); HasCdpArgument = $false }
+  $cdp = [pscustomobject]@{ ProcessId = 702; CreationDate = [DateTime]::UtcNow.AddMinutes(-5); HasCdpArgument = $true }
+  $withoutFlag = [pscustomobject]@{ ProcessId = 703; CreationDate = [DateTime]::UtcNow.AddMinutes(-4); HasCdpArgument = $false }
+  $empty = @{ Mains = @(); Ready = $false }
+  $nativeFrame = @{ Mains = @($native); Ready = $false }
+
+  Invoke-SupervisionScenario @(@{ Mains = @($cdp); Ready = $true }, @{ Mains = @($native, $cdp); Ready = $false }, $empty)
+  Assert-Startup ($script:supervisionLaunches -eq 0 -and $script:supervisionCloses -eq 0) 'Normal quit, missing pages and transient native launches must never restart a managed generation.'
+  Assert-Startup ($script:supervisionStates.Contains('cdp-unavailable') -and $script:supervisionStates.Contains('waiting-for-codex')) 'A missing CDP page must transition to waiting for the next user launch.'
+
+  Invoke-SupervisionScenario @($nativeFrame, @{ Mains = @($withoutFlag); Ready = $false }, @{ Mains = @($withoutFlag); Ready = $false }, @{ Mains = @($withoutFlag); Ready = $true }, $empty) $withoutFlag
+  Assert-Startup ($script:supervisionLaunches -eq 1 -and $script:supervisionCloses -eq 1) 'One native handoff must stay at one launch even beyond the CDP deadline or without a reported flag.'
+  Assert-Startup ($script:supervisionStates.Contains('monitoring')) 'A delayed page must connect without another desktop launch.'
+
+  foreach ($scenario in @(@{ Window = 0 }, @{ CloseAccepted = $false }, @{ IdentityChanged = $true })) {
+    Invoke-SupervisionScenario @($nativeFrame, $empty) @scenario
+    Assert-Startup ($script:supervisionLaunches -eq 0) 'A closed window or vanished native process must cancel the handoff.'
+  }
+}
+
+& {
+  $script:desktopCreates = 0
+  $script:existingDesktop = @()
+  function Get-CodexUsageMainCodexProcesses { return $script:existingDesktop }
+  function Start-CodexUsageDesktopProcess($Port) {
+    $script:desktopCreates++
+    $script:existingDesktop = @([pscustomobject]@{ ProcessId = 704; HasCdpArgument = $true; CommandLine = 'ChatGPT.exe --remote-debugging-port=9340' })
+    return [pscustomobject]@{ ProcessId = 704; Port = 9340 }
+  }
+  $first = Start-CodexUsagePackagedCodex -Port 9340
+  $second = Start-CodexUsagePackagedCodex -Port 9335
+  Assert-Startup ($script:desktopCreates -eq 1 -and $first.ProcessId -eq $second.ProcessId -and $second.Port -eq 9340) 'Repeated startup entrypoints must reuse the actual generation and CDP port.'
+}
+Write-Host 'PASS: startup recovery, shutdown order, single native handoff, normal quit, slow CDP and shared desktop launch.'
