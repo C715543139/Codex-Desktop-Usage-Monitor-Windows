@@ -78,7 +78,8 @@
       const { manager } = await ready();
       const { conversation, turns } = await adapter.history(id);
       const fingerprint = JSON.stringify(turns);
-      const source = await sourceFor(conversation, entry);
+      const persistent = conversation.ephemeral === false;
+      const source = persistent ? { source_id: id } : await sourceFor(conversation, entry);
       const assignment = await adapter.assignment(source.source_id);
       if (entry.fingerprint !== fingerprint) {
         entry.fingerprint = fingerprint;
@@ -88,11 +89,12 @@
         const parent = await manager.getConversation(source.source_id);
         entry.title = `${parent?.title?.trim() || "旁支聊天"}（旁支）`.slice(0, 60);
       }
-      if (!entry.written) entry.written = await request("save", { source_id: source.source_id, source_ref: source.source_ref,
-        side_id: id, save_id: entry.saveId, saved_at: entry.savedAt, turns });
+      if (!entry.written) entry.written = persistent ? await adapter.forkNative(id)
+        : await request("save", { source_id: source.source_id, source_ref: source.source_ref,
+          side_id: id, save_id: entry.saveId, saved_at: entry.savedAt, turns });
       const target = entry.written;
-      await manager.sendRequest("thread/resume", { threadId: target.session_id, path: target.path, excludeTurns: true,
-        ...(conversation.latestModel ? { model: conversation.latestModel } : {}) });
+      if (!persistent) await manager.sendRequest("thread/resume", { threadId: target.session_id, path: target.path, excludeTurns: true,
+          ...(conversation.latestModel ? { model: conversation.latestModel } : {}) });
       await adapter.verify(target.session_id, turns);
       await adapter.assignment(source.source_id, target.session_id, assignment);
       await manager.setThreadTitle(target.session_id, entry.title);
@@ -159,7 +161,12 @@
   }
   window[KEY] = {
     entries,
-    diagnose() { return { available: !initialError, reason: initialError || null, trackedBranches: entries.size }; },
+    diagnose() {
+      const buttons = [...document.querySelectorAll(SELECTOR)];
+      return { available: !initialError, reason: initialError || null, trackedBranches: entries.size,
+        readyButtons: buttons.filter(button => !button.disabled).length,
+        blockedReasons: [...new Set(buttons.filter(button => button.disabled).map(button => button.title))] };
+    },
     receive(requestId, result) {
       const waiter = pending.get(requestId);
       if (!waiter) return;

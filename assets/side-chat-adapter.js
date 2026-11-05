@@ -3,8 +3,9 @@
   const KEY = "__CODEX_USAGE_MONITOR_SIDECHAT_ADAPTER__";
   window[KEY]?.dispose?.();
   const sources = new Map();
-  const known = new Set([...document.querySelectorAll('script[src],link[rel="modulepreload"][href]')].map(node => node.src || node.href));
+  const entryUrls = new Set([...document.querySelectorAll('script[type="module"][src]')].map(node => node.src));
   let cached = null, resolving = null, restoreRegistry = null, capture = null;
+  let runtime = null;
   const wrappers = new WeakMap();
   const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   async function source(url) {
@@ -15,23 +16,55 @@
     }
     return sources.get(url);
   }
-  async function asset(prefix) {
-    const visited = new Set();
-    for (let count = 0; count < 24; count++) {
-      const found = [...known].find(url => new URL(url).pathname.split("/").at(-1).startsWith(prefix));
-      if (found) return { url: found, source: await source(found), module: await import(found) };
-      const next = [...known].filter(url => !visited.has(url)).sort((a, b) => {
-        const rank = url => /\/app-main-/.test(url) ? 0 : /\/app-runtime-/.test(url) ? 1 : /\/index-/.test(url) ? 2 : 3;
-        return rank(a) - rank(b);
-      })[0];
-      if (!next) break;
-      visited.add(next);
-      for (const match of (await source(next)).matchAll(/["'`](\.\/[^"'`]+\.js)["'`]/g)) {
-        const url = new URL(match[1], next);
-        if (url.protocol === "app:" && url.hostname === "-" && url.pathname.startsWith("/assets/")) known.add(url.href);
+  async function rspackRuntime() {
+    if (runtime) return runtime;
+    // Rspack publishes its existing loader from a numbered entry module. Import
+    // only an entry already on this page; never guess chunk IDs or run a copy.
+    for (const url of entryUrls) {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "app:" || parsed.hostname !== "-" || !parsed.pathname.startsWith("/assets/")) continue;
+      if (!(await source(url)).includes("__webpack_require__")) continue;
+      const module = await import(url);
+      const loader = module.__webpack_require__;
+      if (typeof loader === "function" && loader.m && loader.c) return runtime = loader;
+    }
+    throw new Error("当前 Codex 的模块加载器尚未就绪");
+  }
+  function rpcAccessor(value) {
+    if (typeof value !== "function") return false;
+    const text = Function.prototype.toString.call(value);
+    return text.includes("AppServerManager RPC is unavailable for hostId:") && text.includes(".forHost(");
+  }
+  function rspackInterfaces(loader) {
+    const interfaces = [];
+    for (const [id, factory] of Object.entries(loader.m)) {
+      if (typeof factory !== "function") continue;
+      const text = Function.prototype.toString.call(factory);
+      if (!text.includes("AppServerManager RPC is unavailable for hostId:") || !text.includes(".forHost(")) continue;
+      // Read initialized exports only. Instantiating arbitrary lazy modules can
+      // create another manager or run unrelated app startup code.
+      const module = loader.c[id]?.exports;
+      if (!module) continue;
+      for (const accessor of Object.values(module).filter(rpcAccessor)) {
+        const local = Function.prototype.toString.call(accessor).match(/\.get\(([$\w]+)\);if\(/)?.[1];
+        if (!local) continue;
+        // Rspack exports signals as constants in the third require.d argument.
+        // Match the current local binding; minified export names can change.
+        for (const match of text.matchAll(new RegExp(`(?:\\{|,)([$\\w]+):${escape(local)}(?=[,}])`, "g"))) {
+          const signal = module[match[1]];
+          if (signal) interfaces.push({ signal, moduleId: id });
+        }
       }
     }
-    throw new Error(`当前 Codex 缺少 ${prefix} 接口模块`);
+    return interfaces;
+  }
+  function rspackServices(loader) {
+    for (const entry of Object.values(loader.c)) {
+      const exports = entry?.exports;
+      if (!exports || !Object.prototype.hasOwnProperty.call(exports, "appServices")) continue;
+      if (exports.appServices) return exports.appServices;
+    }
+    throw new Error("Codex 项目服务尚未就绪");
   }
   function scopes() {
     const stack = [window.__codexRoot?._internalRoot?.current], seen = new Set(), result = new Set();
@@ -88,33 +121,28 @@
     if (cached) return cached;
     if (resolving) return resolving;
     resolving = (async () => {
-      const initial = await asset("app-initial-");
-      // Locate the real RPC accessor and its exported registry signal, rather than
-      // treating arbitrary RPC properties such as getForHostId as constructors.
-      const factory = Object.values(initial.module).find(value => typeof value === "function"
-        && Function.prototype.toString.call(value).includes("AppServerManager RPC is unavailable for hostId:")
-        && Function.prototype.toString.call(value).includes(".forHost("));
-      const signalName = factory && Function.prototype.toString.call(factory).match(/\.get\(([$\w]+)\);if\(/)?.[1];
-      const exportTail = initial.source.slice(initial.source.lastIndexOf("export{"));
-      const exported = signalName && exportTail.match(new RegExp(`(?:\\{|,)${escape(signalName)} as ([$\\w]+)(?=[,}])`))?.[1];
-      const signal = exported && initial.module[exported];
-      if (!signal) throw new Error("当前 Codex 的会话接口版本尚未适配");
-      for (const scope of scopes()) {
-        let registry;
-        try { registry = scope.get(signal); } catch { continue; }
-        const forHost = registry && Object.getOwnPropertyDescriptor(registry, "forHost")?.value;
-        if (typeof forHost !== "function") continue;
-        let manager;
-        try {
-          manager = forHost.call(registry, "local");
-          if (await manager.getHostId() !== "local") continue;
-        } catch { continue; }
-        restoreRegistry?.();
-        hookRegistry(registry);
-        const rpc = await asset("rpc-");
-        cached = { manager, services: rpc.module.appServices, scope };
-        manager.onRpcBroken?.(() => { restoreRegistry?.(); restoreRegistry = null; cached = null; });
-        return cached;
+      const loader = await rspackRuntime();
+      const interfaces = rspackInterfaces(loader);
+      const services = rspackServices(loader);
+      if (!interfaces.length) throw new Error("当前 Codex 的会话接口版本尚未适配");
+      const availableScopes = scopes();
+      for (const { signal } of interfaces) {
+        for (const scope of availableScopes) {
+          let registry;
+          try { registry = scope.get(signal); } catch { continue; }
+          const forHost = registry && Object.getOwnPropertyDescriptor(registry, "forHost")?.value;
+          if (typeof forHost !== "function") continue;
+          let manager;
+          try {
+            manager = forHost.call(registry, "local");
+            if (await manager.getHostId() !== "local") continue;
+          } catch { continue; }
+          restoreRegistry?.();
+          hookRegistry(registry);
+          cached = { manager, services, scope };
+          manager.onRpcBroken?.(() => { restoreRegistry?.(); restoreRegistry = null; cached = null; });
+          return cached;
+        }
       }
       throw new Error("Codex 本地会话接口尚未就绪");
     })().finally(() => { resolving = null; });
@@ -124,8 +152,11 @@
     const { manager } = await resolve();
     const [conversation, loaded] = await Promise.all([manager.getConversation(id), manager.getLoadedConversationHistory(id)]);
     if (!conversation || !loaded) throw new Error("找不到旁支历史，请保持旁支打开");
-    if (conversation.ephemeral !== true || conversation.sideConversation !== true || conversation.hostId !== "local") throw new Error("目前只支持保存本地临时旁支");
-    if (loaded.isComplete !== true || conversation.turnsPagination?.hasLoadedOldest === false) throw new Error("旁支历史尚未完整加载");
+    if (typeof conversation.ephemeral !== "boolean" || conversation.sideConversation !== true || conversation.hostId !== "local") throw new Error("目前只支持保存本地旁支");
+    // Persistent attached forks are copied by the native manager, including
+    // history pages not mounted in the renderer. Only temporary branches need
+    // the complete loaded history for the local conversion path.
+    if (conversation.ephemeral && (loaded.isComplete !== true || conversation.turnsPagination?.hasLoadedOldest === false)) throw new Error("旁支历史尚未完整加载");
     if (!Array.isArray(loaded.turns)) throw new Error("旁支历史格式尚未适配");
     if (conversation.requests?.length || conversation.unconfirmedTurnSubmissions?.some(turn => turn.terminal !== true)
       || loaded.turns.some(turn => !["completed", "failed", "interrupted"].includes(turn.status)
@@ -140,9 +171,19 @@
   async function status(id) {
     const { manager } = await resolve();
     const [metadata, execution] = await Promise.all([manager.getCachedConversationMetadata(id), manager.getThreadExecutionState(id)]);
-    if (metadata?.ephemeral !== true || metadata.sideConversation !== true) throw new Error("目前只支持保存本地临时旁支");
+    if (typeof metadata?.ephemeral !== "boolean" || metadata.sideConversation !== true) throw new Error("目前只支持保存本地旁支");
     if (execution?.inProgress) throw new Error("请等待旁支回复、工具和审批结束后再保存");
     if (!metadata.latestTurnId) throw new Error("旁支还没有可保存的对话");
+  }
+  async function forkNative(id) {
+    const { manager } = await resolve();
+    await status(id);
+    const result = await manager.forkConversationFromLatest({ sourceConversationId: id,
+      sourceHostId: "local", ephemeral: false, sideConversation: false, addForkedSyntheticItem: false });
+    if (!/^[a-f0-9-]{36}$/i.test(result?.conversationId || "") || result.ephemeral !== false) {
+      throw new Error("原生会话分叉尚未完成，请稍后重试");
+    }
+    return { session_id: result.conversationId };
   }
   async function assignment(sourceId, savedId = null, assignmentValue = undefined) {
     const { services } = await resolve();
@@ -189,8 +230,13 @@
     if (expected.size) throw new Error("新会话历史不完整，原旁支已保留");
   }
   async function open(id) {
-    const { module } = await asset("app-shared-");
-    const dispatcher = Object.values(module).find(value => {
+    const loader = await rspackRuntime();
+    const exports = Object.entries(loader.m).flatMap(([moduleId, factory]) => {
+      if (typeof factory !== "function" || !Function.prototype.toString.call(factory).includes("deliverOrBufferMessage")) return [];
+      const value = loader.c[moduleId]?.exports;
+      return value && (typeof value === "object" || typeof value === "function") ? Object.values(value) : [];
+    });
+    const dispatcher = exports.find(value => {
       if (!value || typeof value !== "object") return false;
       const method = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(value) ?? {}, "dispatchHostMessage")?.value;
       return typeof method === "function" && Function.prototype.toString.call(method).includes("deliverOrBufferMessage");
@@ -200,7 +246,8 @@
     return true;
   }
   window[KEY] = {
-    resolve, history, status, assignment, open, verify,
+    resolve, history, status, forkNative, assignment, open, verify,
+    diagnose() { return { connected: Boolean(cached), runtime: runtime ? "rspack" : null }; },
     captureForks(callback) { capture = callback; },
     dispose() { capture = null; restoreRegistry?.(); restoreRegistry = null; cached = null; },
   };

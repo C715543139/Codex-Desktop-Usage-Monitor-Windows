@@ -6,6 +6,72 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { SideChatStore, buildSavedSideChat } from "../scripts/side-chat-store.mjs";
+import vm from "node:vm";
+
+// Exercise the current desktop bundler through the public adapter, replacing only
+// module import/fetch transport. No real conversations or RPCs are changed.
+const adapterSource = await fs.readFile(new URL("../assets/side-chat-adapter.js", import.meta.url), "utf8");
+{
+  const signal = {};
+  const nativeCopyId = randomUUID();
+  const nativeForks = [];
+  let ephemeral = false;
+  const manager = {
+    async getHostId() { return "local"; },
+    async getConversation() { return { hostId: "local", ephemeral, sideConversation: true }; },
+    async getLoadedConversationHistory() { return { isComplete: false, turns: [{ turnId: "turn", status: "completed", items: [] }] }; },
+    async getCachedConversationMetadata() { return { ephemeral, sideConversation: true, latestTurnId: "turn" }; },
+    async getThreadExecutionState() { return { inProgress: false }; },
+    async forkConversationFromLatest(params) { nativeForks.push(params); return { conversationId: nativeCopyId, ephemeral: false }; },
+  };
+  const registry = { forHost() { return manager; } };
+  const original = registry.forHost;
+  const scope = { get(value) { if (value === signal) return registry; throw new Error("unrecognized signal"); }, watch() {} };
+  const messages = [];
+  class Dispatcher {
+    dispatchHostMessage(message) { this.deliverOrBufferMessage(message); }
+    deliverOrBufferMessage(message) { messages.push(message); }
+  }
+  const services = { threadProjectAssignments: { async readMemberships() { return { assignments: {} }; } } };
+  const accessor = function lookup(e,t){let r=e.get(signal);if(!r)throw Error("AppServerManager RPC is unavailable for hostId:"+t);return r.forHost(t)};
+  const factory = function bundle(e,t,n){let signal={};function lookup(e,t){let r=e.get(signal);if(!r)throw Error("AppServerManager RPC is unavailable for hostId:"+t);return r.forHost(t)}n.d(t,{V:()=>lookup},{renamedSignal:signal})};
+  const modules = new Map([
+    ["app://-/assets/765432.changed.js", { __webpack_require__: Object.assign(() => { throw new Error("Do not instantiate lazy modules"); }, {
+      m: { renamedRegistry: factory, neverLoaded: factory, messages: function messageModule() { return "deliverOrBufferMessage"; } },
+      c: { renamedRegistry: { exports: { V: accessor, renamedSignal: signal } }, services: { exports: { appServices: services } }, messages: { exports: { dispatcher: new Dispatcher() } } },
+    }) }],
+  ]);
+  const fixture = { __codexRoot: { _internalRoot: { current: { memoizedProps: { value: scope } } } } };
+  vm.runInNewContext(adapterSource.replace("import(url)", "fixtureImport(url)"), {
+    window: fixture, URL,
+    document: { querySelectorAll: () => [...modules.keys()].map(src => ({ src })) },
+    fetch: async () => ({ ok: true, text: async () => "export { loader as __webpack_require__ }" }),
+    fixtureImport: async url => { assert.ok(modules.has(url)); return modules.get(url); },
+  });
+  const adapter = fixture.__CODEX_USAGE_MONITOR_SIDECHAT_ADAPTER__;
+  assert.equal((await adapter.resolve()).manager, manager);
+  assert.equal(adapter.diagnose().runtime, "rspack");
+  await adapter.status("branch");
+  assert.equal((await adapter.history("branch")).turns.length, 1);
+  assert.equal((await adapter.forkNative("branch")).session_id, nativeCopyId);
+  assert.equal(nativeForks[0].sourceConversationId, "branch", "copy the persistent branch's own native history");
+  assert.equal(nativeForks[0].sideConversation, false, "the saved fork must be a normal conversation");
+  assert.equal(nativeForks[0].ephemeral, false);
+  ephemeral = true;
+  await adapter.status("branch");
+  await assert.rejects(adapter.history("branch"), /完整加载/, "temporary branches still require full history before conversion");
+  ephemeral = false;
+  let captured = 0;
+  adapter.captureForks(async (_params, send) => { captured++; return send(); });
+  await registry.forHost("local").forkConversationFromLatest({ ephemeral: true, sourceConversationId: "parent" });
+  assert.equal(captured, 1, "new branches must still capture their parent boundary");
+  assert.equal(await adapter.assignment("parent"), null);
+  assert.equal(await adapter.open("saved"), true);
+  assert.equal(messages[0].path, "/local/saved");
+  adapter.dispose();
+  assert.equal(registry.forHost, original, "reload must restore the native registry");
+}
+console.log("PASS: numbered Rspack side-chat interfaces, fork capture and navigation.");
 
 const home = await fs.mkdtemp(path.join(os.tmpdir(), "codex-side-chat-"));
 const sourceId = randomUUID(), sideId = randomUUID(), saveId = randomUUID();
@@ -96,6 +162,12 @@ try {
         const turn = page.data.find(turn => turn.id === turnId);
         assert.equal(turn?.status, "completed");
         assert.deepEqual(turn.items.map(item => item.id), ["side-user", "side-command", "side-agent"]);
+        if (restart === 0) {
+          const fork = await server.request("thread/fork", { threadId: saveId, ephemeral: false });
+          assert.equal(fork.thread.ephemeral, false);
+          const copied = await server.request("thread/turns/list", { threadId: fork.thread.id, itemsView: "full", limit: 100 });
+          assert.deepEqual(copied.data.find(item => item.id === turnId)?.items.map(item => item.id), ["side-user", "side-command", "side-agent"], "native forking must preserve the saved turn and its item identities");
+        }
       } finally { await server.stop(); }
     }
     console.log("PASS: native app-server restores saved side history before and after restart.");

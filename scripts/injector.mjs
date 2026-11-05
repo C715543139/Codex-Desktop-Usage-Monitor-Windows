@@ -226,7 +226,9 @@ export function backendVerificationExpression(expectedPid = null, now = Date.now
     const age = typeof value?.at === "number" ? ${now} - value.at : null;
     return { backendRunning: Boolean(value && Number.isSafeInteger(value.pid) && value.pid > 0 && (expectedPid === null || value.pid === expectedPid) && age !== null && age >= 0 && age <= 15000 && ["connected", "waiting-composer"].includes(value.phase)),
       pid: value?.pid || null, phase: value?.phase || null, heartbeatAgeMs: age,
-      installed: Boolean(document.getElementById(${JSON.stringify(HOST_ID)})?.shadowRoot) };
+      installed: Boolean(document.getElementById(${JSON.stringify(HOST_ID)})?.shadowRoot),
+      sideChat: window.__CODEX_USAGE_MONITOR_SIDECHAT__?.diagnose?.() || null,
+      sideChatAdapter: window.__CODEX_USAGE_MONITOR_SIDECHAT_ADAPTER__?.diagnose?.() || null };
   })()`;
 }
 
